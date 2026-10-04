@@ -47,11 +47,13 @@ needed="$(for f in "$STAGE/paimon_heap.so" "$DEPS"/*; do
 bundled="$(ls "$DEPS")"
 requires="$(comm -23 <(echo "$needed") <(echo "$bundled" | sort -u) | sed 's/$/()(64bit)/')"
 
+# Substitute placeholders ourselves rather than relying on which fields
+# nfpm env-expands.
 cfg="$STAGE/nfpm.yaml"
-cp "$HERE/nfpm.yaml" "$cfg"
-echo "$requires" | sed 's/^/  - /' >> "$cfg"
+sed -e "s|\${ARCH}|$ARCH|g" -e "s|\${VERSION}|$VERSION|g" -e "s|\${STAGE}|$STAGE|g" \
+  "$HERE/nfpm.yaml" > "$cfg"
+[ -n "$requires" ] && echo "$requires" | sed 's/^/  - /' >> "$cfg"
 
-echo "== nfpm.yaml depends =="; sed -n '/^depends:/,$p' "$cfg"
+echo "== nfpm.yaml =="; cat "$cfg"
 
-ARCH="$ARCH" VERSION="$VERSION" STAGE="$STAGE" \
-  nfpm package -f "$cfg" -p rpm -t "$OUT/"
+nfpm package -f "$cfg" -p rpm -t "$OUT/"
