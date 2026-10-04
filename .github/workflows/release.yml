@@ -163,10 +163,145 @@ jobs:
           name: extension-pg18-linux-${{ matrix.arch }}
           path: dist/*.tar.gz
 
+  # ── RPM — Rocky Linux 9 (RHEL 9 compatible), PGDG PG 18, dynamic build ──────
+  build-rpm:
+    name: RPM (PG 18, el9, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+            nfpm-arch: x86_64
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+            nfpm-arch: arm64
+    runs-on: ${{ matrix.runs-on }}
+    container: rockylinux:9
+    env:
+      NFPM_VERSION: "2.41.0"
+
+    steps:
+      - name: Install system deps
+        run: |
+          dnf install -y dnf-plugins-core epel-release
+          dnf config-manager --set-enabled crb
+          dnf install -y --allowerasing \
+            gcc gcc-c++ make cmake ninja-build git tar gzip zstd patchelf \
+            pkgconf-pkg-config bison flex wget findutils which clang llvm \
+            readline-devel zlib-devel openssl-devel libxml2-devel \
+            libcurl-devel libuuid-devel krb5-devel cyrus-sasl-devel \
+            libgsasl-devel protobuf-devel protobuf-compiler \
+            bzip2-devel snappy-devel libzstd-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Install Apache Arrow 18
+        run: |
+          dnf install -y \
+            "https://packages.apache.org/artifactory/arrow/almalinux/9/apache-arrow-release-latest.rpm"
+          dnf install -y arrow-devel-18.1.0 parquet-devel-18.1.0
+
+      - name: Install PostgreSQL 18 (PGDG)
+        run: |
+          dnf install -y \
+            "https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm"
+          dnf -qy module disable postgresql
+          dnf install -y postgresql18-devel postgresql18-server
+
+      - name: Cache AWS SDK (shared)
+        id: cache-aws
+        uses: actions/cache@v4
+        with:
+          path: /opt/aws-sdk-cpp
+          key: aws-sdk-shared-1.11.360-el9-${{ matrix.arch }}
+
+      - name: Build AWS SDK (shared)
+        if: steps.cache-aws.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules \
+            --branch 1.11.360 \
+            https://github.com/aws/aws-sdk-cpp.git /tmp/aws-sdk-cpp
+          cmake -S /tmp/aws-sdk-cpp -B /tmp/aws-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/aws-sdk-cpp \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_ONLY="s3;core" -DENABLE_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=ON -DAUTORUN_UNIT_TESTS=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build /tmp/aws-build --parallel "$(nproc)"
+          cmake --install /tmp/aws-build
+          rm -rf /tmp/aws-sdk-cpp /tmp/aws-build
+
+      - name: Cache libhdfs3
+        id: cache-hdfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/libhdfs3*
+            /usr/local/include/hdfs
+            /usr/local/lib/pkgconfig/libhdfs3.pc
+          key: libhdfs3-hawq-pic-v2-el9-${{ matrix.arch }}
+
+      - name: Build libhdfs3
+        if: steps.cache-hdfs.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/apache/hawq /tmp/hawq
+          sed -i 's/-dumpversion/-dumpfullversion/' \
+              /tmp/hawq/depends/libhdfs3/CMake/Platform.cmake
+          sed -i 's/FIND_PACKAGE(GoogleTest REQUIRED)/FIND_PACKAGE(GoogleTest)/' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          sed -i '/[Aa][Dd][Dd]_\?[Ss][Uu][Bb][Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy].*test/Id' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          cmake -S /tmp/hawq/depends/thirdparty/googletest \
+                -B /tmp/gtest-build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_GMOCK=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build /tmp/gtest-build
+          cmake --install /tmp/gtest-build
+          cmake -S /tmp/hawq/depends/libhdfs3 -B /tmp/hdfs3-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_CXX_FLAGS="-include cstdint -include sys/types.h" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DGtest_LIBRARY=/usr/local/lib/libgtest.a \
+            -DGmock_LIBRARY=/usr/local/lib/libgmock.a \
+            -DGtest_INCLUDE_DIR=/usr/local/include \
+            -DGmock_INCLUDE_DIR=/usr/local/include
+          cmake --build /tmp/hdfs3-build --parallel "$(nproc)"
+          cmake --install /tmp/hdfs3-build
+          ldconfig
+
+      - name: Build extension (dynamic)
+        working-directory: extension
+        run: |
+          echo /opt/aws-sdk-cpp/lib > /etc/ld.so.conf.d/aws-sdk-cpp.conf
+          ldconfig
+          make -j"$(nproc)" \
+            PG_CONFIG=/usr/pgsql-18/bin/pg_config \
+            AWS_SDK_ROOT=/opt/aws-sdk-cpp \
+            HDFS3_ROOT=/usr/local
+
+      - name: Install nfpm
+        run: |
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${{ matrix.nfpm-arch }}.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+
+      - name: Package RPM
+        run: extension/packaging/build-rpm.sh "${{ github.ref_name }}" "${{ matrix.arch }}" dist
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-el9-${{ matrix.arch }}
+          path: dist/*.rpm
+
   # ── GitHub release ───────────────────────────────────────────────────────────
   release:
     name: Create GitHub release
-    needs: [build-extension]
+    needs: [build-extension, build-rpm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
