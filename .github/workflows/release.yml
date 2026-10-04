@@ -177,7 +177,7 @@ jobs:
             runs-on: ubuntu-24.04-arm
             nfpm-arch: arm64
     runs-on: ${{ matrix.runs-on }}
-    container: rockylinux:9
+    container: rockylinux/rockylinux:9   # Docker Official Image `rockylinux:9` is frozen at 9.3
     env:
       NFPM_VERSION: "2.41.0"
 
