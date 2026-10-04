@@ -1,5 +1,5 @@
 # nfpm config for the paimon_heap RPM (PGDG layout, PostgreSQL 18).
-# Driven by build-rpm.sh, which sets ARCH / VERSION / STAGE and appends the
+# Driven by build-rpm.sh, which substitutes ARCH / VERSION / STAGE and appends the
 # generated soname dependencies below the `depends:` key.
 name: postgresql18-paimon-heap
 arch: ${ARCH}
