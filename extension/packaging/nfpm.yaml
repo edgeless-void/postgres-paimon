@@ -1,0 +1,26 @@
+# nfpm config for the paimon_heap RPM (PGDG layout, PostgreSQL 18).
+# Driven by build-rpm.sh, which substitutes ARCH / VERSION / STAGE and appends the
+# generated soname dependencies below the `depends:` key.
+name: postgresql18-paimon-heap
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: database
+description: Heap table access method for PostgreSQL with Paimon lake offload
+homepage: https://github.com/VadimSurpin/postgres-paimon
+license: Apache-2.0
+contents:
+  - src: ${STAGE}/paimon_heap.so
+    dst: /usr/pgsql-18/lib/paimon_heap.so
+    file_info:
+      mode: 0755
+  - src: ${STAGE}/paimon_heap.control
+    dst: /usr/pgsql-18/share/extension/paimon_heap.control
+  - src: ${STAGE}/paimon_heap--1.0.sql
+    dst: /usr/pgsql-18/share/extension/paimon_heap--1.0.sql
+  - src: ${STAGE}/deps
+    dst: /usr/pgsql-18/lib/paimon_heap-deps
+    type: tree
+# Keep `depends:` last: build-rpm.sh appends one entry per line.
+depends:
+  - postgresql18-server
