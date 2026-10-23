@@ -536,10 +536,48 @@ jobs:
           DROP TABLE smoke;
           SQL
 
+  # ── Playground (docker/playground) against the Debian 13 package ─────────────
+  test-playground:
+    name: Test playground (${{ matrix.arch.name }})
+    needs: [build-deb]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: amd64, runs-on: ubuntu-latest }
+          - { name: arm64, runs-on: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.arch.runs-on }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: docker/playground
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-debian13-${{ matrix.arch.name }}
+          path: docker/playground/postgres/debs
+
+      - name: Start playground
+        run: docker compose up -d --build --wait --wait-timeout 300
+
+      - name: Smoke test
+        run: scripts/smoke.sh
+
+      - name: Show logs
+        if: always()
+        run: docker compose logs --no-color
+
+      - name: Stop playground
+        if: always()
+        run: docker compose down -v
+
   # ── GitHub release ───────────────────────────────────────────────────────────
   release:
     name: Create GitHub release
-    needs: [build-extension, build-rpm, build-deb, test-deb]
+    needs: [build-extension, build-rpm, build-deb, test-deb, test-playground]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
