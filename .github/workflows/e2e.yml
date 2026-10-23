@@ -27,9 +27,19 @@ jobs:
       E2E_MINIO_PORT: "9100"
       # MiniDFSCluster requires shaded Jetty classes that are hard to bundle; skip in CI
       E2E_SKIP_HDFS: "true"
+      # dl.min.io no longer serves community binaries (HTTP 410); these are the
+      # last minio/mc GitHub releases that still ship them.
+      MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+      MC_RELEASE:    RELEASE.2025-08-13T08-35-41Z
 
     steps:
       - uses: actions/checkout@v4
+
+      # Native build caches are only valid for the Ubuntu release that built
+      # them, and ubuntu-latest moves; key them on it.
+      - name: Detect OS
+        id: os
+        run: echo "id=$(. /etc/os-release && echo "${ID}${VERSION_ID}")" >> "$GITHUB_OUTPUT"
 
       # ── System deps (same set as release.yml) ──────────────────────────────
       - name: Install system deps
@@ -43,14 +53,15 @@ jobs:
             libkrb5-dev libsasl2-dev libgsasl-dev libprotobuf-dev protobuf-compiler \
             libbz2-dev libsnappy-dev libzstd-dev libthrift-dev
 
-      - name: Install Apache Arrow 18
+      # 24.0.0 matches the RPM/DEB builds and is built for Ubuntu 26.04.
+      - name: Install Apache Arrow 24
         run: |
           wget -q "https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release -cs).deb" \
                -O /tmp/arrow.deb
           sudo apt-get install -y /tmp/arrow.deb
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libarrow-dev=18.1.0-1 libparquet-dev=18.1.0-1
+            libarrow-dev=24.0.0-1 libparquet-dev=24.0.0-1
 
       # ── PostgreSQL 18 ───────────────────────────────────────────────────────
       - name: Install PostgreSQL 18
@@ -69,7 +80,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/aws-sdk-cpp
-          key: aws-sdk-shared-1.11.360-amd64-${{ runner.os }}
+          key: aws-sdk-shared-1.11.360-${{ steps.os.outputs.id }}-amd64
 
       - name: Build AWS SDK
         if: steps.cache-aws.outputs.cache-hit != 'true'
@@ -96,7 +107,7 @@ jobs:
             /usr/local/lib/libhdfs3*
             /usr/local/include/hdfs
             /usr/local/lib/pkgconfig/libhdfs3.pc
-          key: libhdfs3-hawq-pic-v2-amd64-${{ runner.os }}
+          key: libhdfs3-hawq-pic-v2-${{ steps.os.outputs.id }}-amd64
 
       - name: Build libhdfs3
         if: steps.cache-hdfs.outputs.cache-hit != 'true'
@@ -111,7 +122,8 @@ jobs:
           cmake -S /tmp/hawq/depends/thirdparty/googletest \
                 -B /tmp/gtest-build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release -DBUILD_GMOCK=ON \
-                -DCMAKE_INSTALL_PREFIX=/usr/local
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build /tmp/gtest-build
           sudo cmake --install /tmp/gtest-build
           cmake -S /tmp/hawq/depends/libhdfs3 -B /tmp/hdfs3-build \
@@ -122,7 +134,8 @@ jobs:
             -DGtest_LIBRARY=/usr/local/lib/libgtest.a \
             -DGmock_LIBRARY=/usr/local/lib/libgmock.a \
             -DGtest_INCLUDE_DIR=/usr/local/include \
-            -DGmock_INCLUDE_DIR=/usr/local/include
+            -DGmock_INCLUDE_DIR=/usr/local/include \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           sudo cmake --build /tmp/hdfs3-build --parallel "$(nproc)"
           sudo cmake --install /tmp/hdfs3-build
           sudo ldconfig
@@ -197,12 +210,19 @@ jobs:
 
       # ── Download MinIO and mc ───────────────────────────────────────────────
       - name: Download MinIO
+        working-directory: /tmp
         run: |
-          wget -q https://dl.min.io/server/minio/release/linux-amd64/minio \
-               -O /usr/local/bin/minio
-          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc \
-               -O /usr/local/bin/mc
-          sudo chmod +x /usr/local/bin/minio /usr/local/bin/mc
+          fetch() {  # <repo> <name> <release>
+            local f="$2.linux-amd64.$3"
+            curl -fsSLO "https://github.com/minio/$1/releases/download/$3/$f"
+            curl -fsSLO "https://github.com/minio/$1/releases/download/$3/$f.sha256sum"
+            # The .sha256sum names the file without ".linux-amd64"; use the hash only.
+            echo "$(cut -d' ' -f1 "$f.sha256sum")  $f" | sha256sum -c
+            sudo install -m 0755 "$f" "/usr/local/bin/$2"
+          }
+          fetch minio minio "$MINIO_RELEASE"
+          fetch mc    mc    "$MC_RELEASE"
+          minio --version
 
       # ── Build the offload-test jar ──────────────────────────────────────────
       - name: Set up Java 17
