@@ -92,7 +92,7 @@ jobs:
             /usr/local/lib/libhdfs3*
             /usr/local/include/hdfs
             /usr/local/lib/pkgconfig/libhdfs3.pc
-          key: libhdfs3-hawq-pic-v2-${{ matrix.arch }}-${{ runner.os }}
+          key: libhdfs3-hawq-pic-v3-${{ matrix.arch }}-${{ runner.os }}
 
       - name: Build libhdfs3
         if: steps.cache-hdfs.outputs.cache-hit != 'true'
@@ -100,6 +100,13 @@ jobs:
           git clone --depth=1 https://github.com/apache/hawq /tmp/hawq
           sed -i 's/-dumpversion/-dumpfullversion/' \
               /tmp/hawq/depends/libhdfs3/CMake/Platform.cmake
+          # libhdfs3 builds with -mcpu=native: on arm64 that ties the binary to
+          # the runner's CPU, and breaks the build when GCC doesn't detect CRC32
+          # there (HWCrc32c needs __ARM_FEATURE_CRC32). Target generic armv8-a+crc.
+          if [ "$(uname -m)" = aarch64 ]; then
+            sed -i 's/-mcpu=native/-march=armv8-a+crc/' \
+                /tmp/hawq/depends/libhdfs3/CMake/Options.cmake
+          fi
           sed -i 's/FIND_PACKAGE(GoogleTest REQUIRED)/FIND_PACKAGE(GoogleTest)/' \
               /tmp/hawq/depends/libhdfs3/CMakeLists.txt
           sed -i '/[Aa][Dd][Dd]_\?[Ss][Uu][Bb][Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy].*test/Id' \
@@ -251,7 +258,7 @@ jobs:
             /usr/local/lib/libhdfs3*
             /usr/local/include/hdfs
             /usr/local/lib/pkgconfig/libhdfs3.pc
-          key: libhdfs3-hawq-pic-v2-el9-${{ matrix.arch }}
+          key: libhdfs3-hawq-pic-v3-el9-${{ matrix.arch }}
 
       - name: Build libhdfs3
         if: steps.cache-hdfs.outputs.cache-hit != 'true'
@@ -259,6 +266,13 @@ jobs:
           git clone --depth=1 https://github.com/apache/hawq /tmp/hawq
           sed -i 's/-dumpversion/-dumpfullversion/' \
               /tmp/hawq/depends/libhdfs3/CMake/Platform.cmake
+          # libhdfs3 builds with -mcpu=native: on arm64 that ties the binary to
+          # the runner's CPU, and breaks the build when GCC doesn't detect CRC32
+          # there (HWCrc32c needs __ARM_FEATURE_CRC32). Target generic armv8-a+crc.
+          if [ "$(uname -m)" = aarch64 ]; then
+            sed -i 's/-mcpu=native/-march=armv8-a+crc/' \
+                /tmp/hawq/depends/libhdfs3/CMake/Options.cmake
+          fi
           sed -i 's/FIND_PACKAGE(GoogleTest REQUIRED)/FIND_PACKAGE(GoogleTest)/' \
               /tmp/hawq/depends/libhdfs3/CMakeLists.txt
           sed -i '/[Aa][Dd][Dd]_\?[Ss][Uu][Bb][Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy].*test/Id' \
@@ -405,7 +419,7 @@ jobs:
             /usr/local/lib/libhdfs3*
             /usr/local/include/hdfs
             /usr/local/lib/pkgconfig/libhdfs3.pc
-          key: libhdfs3-hawq-pic-v2-${{ matrix.os.id }}-${{ matrix.arch.name }}
+          key: libhdfs3-hawq-pic-v3-${{ matrix.os.id }}-${{ matrix.arch.name }}
 
       - name: Build libhdfs3
         if: steps.cache-hdfs.outputs.cache-hit != 'true'
@@ -413,6 +427,13 @@ jobs:
           git clone --depth=1 https://github.com/apache/hawq /tmp/hawq
           sed -i 's/-dumpversion/-dumpfullversion/' \
               /tmp/hawq/depends/libhdfs3/CMake/Platform.cmake
+          # libhdfs3 builds with -mcpu=native: on arm64 that ties the binary to
+          # the runner's CPU, and breaks the build when GCC doesn't detect CRC32
+          # there (HWCrc32c needs __ARM_FEATURE_CRC32). Target generic armv8-a+crc.
+          if [ "$(uname -m)" = aarch64 ]; then
+            sed -i 's/-mcpu=native/-march=armv8-a+crc/' \
+                /tmp/hawq/depends/libhdfs3/CMake/Options.cmake
+          fi
           sed -i 's/FIND_PACKAGE(GoogleTest REQUIRED)/FIND_PACKAGE(GoogleTest)/' \
               /tmp/hawq/depends/libhdfs3/CMakeLists.txt
           sed -i '/[Aa][Dd][Dd]_\?[Ss][Uu][Bb][Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy].*test/Id' \
