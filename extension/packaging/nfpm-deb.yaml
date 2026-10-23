@@ -1,0 +1,29 @@
+# nfpm config for the paimon_heap .deb (Debian/PGDG layout, PostgreSQL 18).
+# Driven by build-deb.sh, which substitutes ARCH / VERSION / RELEASE / STAGE and
+# appends the generated library dependencies below the `depends:` key.
+name: postgresql-18-paimon-heap
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: ${RELEASE}
+section: database
+priority: optional
+maintainer: postgres-paimon <noreply@github.com>
+description: Heap table access method for PostgreSQL with Paimon lake offload
+homepage: https://github.com/VadimSurpin/postgres-paimon
+license: Apache-2.0
+contents:
+  - src: ${STAGE}/paimon_heap.so
+    dst: /usr/lib/postgresql/18/lib/paimon_heap.so
+    file_info:
+      mode: 0644
+  - src: ${STAGE}/paimon_heap.control
+    dst: /usr/share/postgresql/18/extension/paimon_heap.control
+  - src: ${STAGE}/paimon_heap--1.0.sql
+    dst: /usr/share/postgresql/18/extension/paimon_heap--1.0.sql
+  - src: ${STAGE}/deps
+    dst: /usr/lib/postgresql/18/lib/paimon_heap-deps
+    type: tree
+# Keep `depends:` last: build-deb.sh appends one entry per line.
+depends:
+  - postgresql-18

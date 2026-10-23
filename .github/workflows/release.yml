@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual runs build every package without publishing a release.
+  workflow_dispatch:
+
+env:
+  # Tag builds use the tag; manual runs get a dev version.
+  PKG_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('0.0.0-dev.{0}', github.run_number) }}
 
 jobs:
   # ── C++ extension — PG 18, linux/amd64 and linux/arm64 ──────────────────────
@@ -13,8 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Arrow 18.1.0 has no Ubuntu 26.04 build, and ubuntu-latest is 26.04.
           - arch: amd64
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
           - arch: arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
@@ -135,7 +142,7 @@ jobs:
       # ── Package ───────────────────────────────────────────────────────────
       - name: Package
         run: |
-          VER="${{ github.ref_name }}"
+          VER="${PKG_VERSION}"
           ARCH="${{ matrix.arch }}"
 
           strip --strip-unneeded extension/paimon_heap.so
@@ -291,7 +298,7 @@ jobs:
             | tar -xz -C /usr/local/bin nfpm
 
       - name: Package RPM
-        run: extension/packaging/build-rpm.sh "${{ github.ref_name }}" "${{ matrix.arch }}" dist
+        run: extension/packaging/build-rpm.sh "${PKG_VERSION}" "${{ matrix.arch }}" dist
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
@@ -299,10 +306,239 @@ jobs:
           name: rpm-el9-${{ matrix.arch }}
           path: dist/*.rpm
 
+  # ── DEB — Debian 12/13, Ubuntu 24.04/26.04, PGDG PG 18, dynamic build ───────
+  # Each distro gets its own build: glibc only runs old→new, and sonames differ
+  # (e.g. libxml2.so.2 → libxml2.so.16 on 26.04, which libhdfs3 links).
+  build-deb:
+    name: DEB (PG 18, ${{ matrix.os.id }}, ${{ matrix.arch.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - { image: "debian:12",    id: debian12 }
+          - { image: "debian:13",    id: debian13 }
+          - { image: "ubuntu:24.04", id: ubuntu24.04 }
+          - { image: "ubuntu:26.04", id: ubuntu26.04 }
+        arch:
+          - { name: amd64, runs-on: ubuntu-latest,    nfpm-arch: x86_64 }
+          - { name: arm64, runs-on: ubuntu-24.04-arm, nfpm-arch: arm64 }
+    runs-on: ${{ matrix.arch.runs-on }}
+    container: ${{ matrix.os.image }}
+    # Uncached AWS SDK + libhdfs3 builds take ~25 min; fail fast on apt hangs.
+    timeout-minutes: 90
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NFPM_VERSION: "2.41.0"
+      # 24.0.0 is the newest Arrow with builds for all four distros.
+      ARROW_VERSION: "24.0.0-1"
+
+    steps:
+      - name: Configure apt retries
+        run: |
+          printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' \
+            > /etc/apt/apt.conf.d/80-ci-retries
+
+      - name: Install system deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git ca-certificates \
+            curl gnupg patchelf file \
+            bison flex libreadline-dev zlib1g-dev libssl-dev libxml2-dev \
+            libcurl4-openssl-dev uuid-dev \
+            libkrb5-dev libsasl2-dev libgsasl-dev libprotobuf-dev protobuf-compiler \
+            libbz2-dev libsnappy-dev libzstd-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install Apache Arrow ${{ env.ARROW_VERSION }}
+        run: |
+          . /etc/os-release
+          curl -fsSL -o /tmp/arrow.deb \
+            "https://packages.apache.org/artifactory/arrow/${ID}/apache-arrow-apt-source-latest-${VERSION_CODENAME}.deb"
+          apt-get install -y /tmp/arrow.deb
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            libarrow-dev="${ARROW_VERSION}" libparquet-dev="${ARROW_VERSION}"
+
+      - name: Install PostgreSQL 18 (PGDG)
+        run: |
+          . /etc/os-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list
+          apt-get update
+          apt-get install -y postgresql-server-dev-18
+
+      - name: Cache AWS SDK (shared)
+        id: cache-aws
+        uses: actions/cache@v4
+        with:
+          path: /opt/aws-sdk-cpp
+          key: aws-sdk-shared-1.11.360-${{ matrix.os.id }}-${{ matrix.arch.name }}
+
+      - name: Build AWS SDK (shared)
+        if: steps.cache-aws.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --recurse-submodules --shallow-submodules \
+            --branch 1.11.360 \
+            https://github.com/aws/aws-sdk-cpp.git /tmp/aws-sdk-cpp
+          cmake -S /tmp/aws-sdk-cpp -B /tmp/aws-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/aws-sdk-cpp \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_ONLY="s3;core" -DENABLE_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=ON -DAUTORUN_UNIT_TESTS=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build /tmp/aws-build --parallel "$(nproc)"
+          cmake --install /tmp/aws-build
+          rm -rf /tmp/aws-sdk-cpp /tmp/aws-build
+
+      - name: Cache libhdfs3
+        id: cache-hdfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/libhdfs3*
+            /usr/local/include/hdfs
+            /usr/local/lib/pkgconfig/libhdfs3.pc
+          key: libhdfs3-hawq-pic-v2-${{ matrix.os.id }}-${{ matrix.arch.name }}
+
+      - name: Build libhdfs3
+        if: steps.cache-hdfs.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/apache/hawq /tmp/hawq
+          sed -i 's/-dumpversion/-dumpfullversion/' \
+              /tmp/hawq/depends/libhdfs3/CMake/Platform.cmake
+          sed -i 's/FIND_PACKAGE(GoogleTest REQUIRED)/FIND_PACKAGE(GoogleTest)/' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          sed -i '/[Aa][Dd][Dd]_\?[Ss][Uu][Bb][Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy].*test/Id' \
+              /tmp/hawq/depends/libhdfs3/CMakeLists.txt
+          cmake -S /tmp/hawq/depends/thirdparty/googletest \
+                -B /tmp/gtest-build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_GMOCK=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build /tmp/gtest-build
+          cmake --install /tmp/gtest-build
+          cmake -S /tmp/hawq/depends/libhdfs3 -B /tmp/hdfs3-build \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_CXX_FLAGS="-include cstdint -include sys/types.h" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DGtest_LIBRARY=/usr/local/lib/libgtest.a \
+            -DGmock_LIBRARY=/usr/local/lib/libgmock.a \
+            -DGtest_INCLUDE_DIR=/usr/local/include \
+            -DGmock_INCLUDE_DIR=/usr/local/include \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build /tmp/hdfs3-build --parallel "$(nproc)"
+          cmake --install /tmp/hdfs3-build
+          ldconfig
+
+      - name: Build extension (dynamic)
+        working-directory: extension
+        run: |
+          echo /opt/aws-sdk-cpp/lib > /etc/ld.so.conf.d/aws-sdk-cpp.conf
+          ldconfig
+          make -j"$(nproc)" \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            AWS_SDK_ROOT=/opt/aws-sdk-cpp \
+            HDFS3_ROOT=/usr/local
+
+      - name: Install nfpm
+        run: |
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${{ matrix.arch.nfpm-arch }}.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+
+      - name: Package DEB
+        run: extension/packaging/build-deb.sh "${PKG_VERSION}" "${{ matrix.arch.name }}" dist
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.os.id }}-${{ matrix.arch.name }}
+          path: dist/*.deb
+
+  # Install each .deb into a clean container (only the PGDG and Arrow repos
+  # added) to check that Depends: is complete and the library loads.
+  test-deb:
+    name: Test DEB (${{ matrix.os.id }}, ${{ matrix.arch.name }})
+    needs: [build-deb]
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - { image: "debian:12",    id: debian12 }
+          - { image: "debian:13",    id: debian13 }
+          - { image: "ubuntu:24.04", id: ubuntu24.04 }
+          - { image: "ubuntu:26.04", id: ubuntu26.04 }
+        arch:
+          - { name: amd64, runs-on: ubuntu-latest }
+          - { name: arm64, runs-on: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.arch.runs-on }}
+    container: ${{ matrix.os.image }}
+    timeout-minutes: 20
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Configure apt retries
+        run: |
+          printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' \
+            > /etc/apt/apt.conf.d/80-ci-retries
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.os.id }}-${{ matrix.arch.name }}
+          path: dist
+
+      - name: Add PGDG and Apache Arrow repos
+        run: |
+          . /etc/os-release
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list
+          curl -fsSL -o /tmp/arrow.deb \
+            "https://packages.apache.org/artifactory/arrow/${ID}/apache-arrow-apt-source-latest-${VERSION_CODENAME}.deb"
+          apt-get install -y /tmp/arrow.deb
+          apt-get update
+
+      - name: Install package
+        run: |
+          apt-get install -y ./dist/*.deb
+          dpkg -s postgresql-18-paimon-heap
+          if ldd /usr/lib/postgresql/18/lib/paimon_heap.so | grep 'not found'; then
+            exit 1
+          fi
+
+      - name: CREATE EXTENSION and smoke test
+        run: |
+          # paimon_heap.warehouse is PGC_SIGHUP, so it goes in the config file.
+          cat >> /etc/postgresql/18/main/postgresql.conf <<'CONF'
+          shared_preload_libraries = 'paimon_heap'
+          paimon_heap.warehouse = '/tmp/paimon-smoke-warehouse'
+          CONF
+          pg_ctlcluster 18 main start
+          su postgres -c "psql -v ON_ERROR_STOP=1" <<'SQL'
+          CREATE EXTENSION paimon_heap;
+          SELECT extname, extversion FROM pg_extension WHERE extname = 'paimon_heap';
+          CREATE TABLE smoke (id int, payload text) USING paimon_heap;
+          INSERT INTO smoke VALUES (1, 'alpha'), (2, 'beta');
+          SELECT * FROM smoke ORDER BY id;
+          DROP TABLE smoke;
+          SQL
+
   # ── GitHub release ───────────────────────────────────────────────────────────
   release:
     name: Create GitHub release
-    needs: [build-extension, build-rpm]
+    needs: [build-extension, build-rpm, build-deb, test-deb]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
