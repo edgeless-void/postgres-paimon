@@ -1,0 +1,11 @@
+{
+  "identities": [
+    {
+      "name": "playground",
+      "credentials": [
+        { "accessKey": "playground", "secretKey": "playground-secret" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
