@@ -11,6 +11,11 @@ env:
   # Tag builds use the tag; manual runs get a dev version.
   PKG_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('0.0.0-dev.{0}', github.run_number) }}
 
+# A newer push to the same branch supersedes a running build; tag builds always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
   # ── C++ extension — PG 18, linux/amd64 and linux/arm64 ──────────────────────
   build-extension:
@@ -25,9 +30,15 @@ jobs:
           - arch: arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure apt retries
+        run: |
+          printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' \
+            | sudo tee /etc/apt/apt.conf.d/80-ci-retries
 
       - name: Install system deps
         run: |
@@ -192,6 +203,7 @@ jobs:
             nfpm-arch: arm64
     runs-on: ${{ matrix.runs-on }}
     container: rockylinux/rockylinux:9   # Docker Official Image `rockylinux:9` is frozen at 9.3
+    timeout-minutes: 90
     env:
       NFPM_VERSION: "2.41.0"
       # Same Arrow as the DEBs (24.0.0 is the newest built for every target).
@@ -310,7 +322,7 @@ jobs:
 
       - name: Install nfpm
         run: |
-          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${{ matrix.nfpm-arch }}.tar.gz" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${{ matrix.nfpm-arch }}.tar.gz" \
             | tar -xz -C /usr/local/bin nfpm
 
       - name: Package RPM
@@ -473,7 +485,7 @@ jobs:
 
       - name: Install nfpm
         run: |
-          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${{ matrix.arch.nfpm-arch }}.tar.gz" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${{ matrix.arch.nfpm-arch }}.tar.gz" \
             | tar -xz -C /usr/local/bin nfpm
 
       - name: Package DEB
