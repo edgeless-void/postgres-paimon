@@ -70,7 +70,16 @@ The extension implements a custom **Table Access Method (TAM)** that intercepts 
 └──────────────────────────────────────────────────────┘
 ```
 
-**DDL propagation** is handled by a `ProcessUtility` hook. `CREATE TABLE` bootstraps the Paimon schema; `ALTER TABLE` evolves it; `DROP TABLE` and `TRUNCATE` are forwarded to the bgworker before execution so catalog state is still available. Primary key changes are blocked with an error.
+**DDL propagation is transactional.** DDL events are queued in the same per-transaction buffer as DML and reach the bgworker only when, and if, the transaction commits, in the order they happened. A failed or rolled-back `DROP`, `TRUNCATE` or `ALTER` (including `ROLLBACK TO SAVEPOINT` and PL/pgSQL exception blocks) never touches the lake. `CREATE TABLE` creates the Paimon table; `ALTER TABLE` and `RENAME COLUMN` send the table's full resulting schema, which the bgworker reconciles by field id (add, drop, rename, type, nullability). Drops and truncates are captured with an `object_access_hook`, so cascades (`DROP SCHEMA … CASCADE`, `DROP OWNED`, `DROP EXTENSION`, `TRUNCATE … CASCADE`, inheritance children) are mirrored too. Primary key changes are blocked with an error.
+
+**Lake layout.** PostgreSQL schema `public` maps to the Paimon database `default`; any other schema maps to the Paimon database of the same name, so `s1.t` and `s2.t` are separate lake tables:
+
+| PostgreSQL | Local warehouse / staging | S3 / HDFS |
+|---|---|---|
+| `public.orders` | `<warehouse>/default.db/orders` | `<prefix>/orders` |
+| `sales.orders` | `<warehouse>/sales.db/orders` | `<prefix>/sales.db/orders` |
+
+**Remote sync** is bottom-up: data files, then manifests, schema, snapshots, and `snapshot/LATEST` last. A layer is only published once everything below it uploaded, so S3/HDFS never expose a snapshot that references missing files. Local Parquet files are removed only after every configured target (S3 and HDFS) has them.
 
 **Schema evolution** is encoded natively in the Paimon schema format. Each `ALTER TABLE` operation writes a new `schema-N` file and atomically updates `LATEST`. The bgworker reads the current schema version before writing each row group, so the Parquet files are always schema-aligned.
 
@@ -122,6 +131,8 @@ extension/          C++ PostgreSQL extension (TAM + bgworker)
   paimon_table_writer.* Top-level writer: dispatches to schema/manifest/parquet/snapshot
   paimon_offload_s3.*   S3 upload (AWS SDK for C++)
   paimon_offload_hdfs.* HDFS upload (libhdfs3)
+  paimon_offload_common.h Upload ordering shared by S3 and HDFS
+  paimon_relmeta.h  Relation → lake identity / schema helpers
   paimon_event.h    Wire protocol between TAM and bgworker
   type_map.h        PaimonTypeCode → Arrow/Parquet type mapping
   type_map_pg.h     PostgreSQL OID → PaimonTypeCode mapping
@@ -477,8 +488,12 @@ When the warehouse lives on the same disk as PostgreSQL data files, the bgworker
 
 - **PostgreSQL 16+ only.** The extension requires `WaitEventExtensionNew` (PG 16) and `shmem_request_hook` (PG 15). PG 14 and 15 are not supported. Release binaries target PG 18.
 - **Primary key is immutable.** Changing a table's primary key after data has been written is not supported. Recreate the table.
+- **Table location is immutable.** `ALTER TABLE … RENAME TO`, `ALTER TABLE … SET SCHEMA` and `ALTER SCHEMA … RENAME` (for a schema containing `paimon_heap` tables) are blocked, because the lake path is derived from the schema and table name. Renaming columns is supported.
+- **No two-phase commit.** `PREPARE TRANSACTION` is rejected when the transaction modified `paimon_heap` tables (as PostgreSQL does for temporary tables).
+- **`DROP TABLE` removes the lake table's metadata** (`schema/`, `snapshot/`, `manifest/`) locally, in the warehouse and on S3/HDFS, so readers no longer see the table and a table re-created under the same name starts clean. Data files (`bucket-0/`) are left in place and can be cleaned up separately.
+- **Temporary tables are not mirrored**, and neither are the transient heaps PostgreSQL builds while rewriting a table (`ALTER COLUMN TYPE`, `SET ACCESS METHOD`).
 - **Non-nullable column additions are blocked.** `ALTER TABLE ... ADD COLUMN col TYPE NOT NULL` without a default is rejected because it cannot be represented in the existing Paimon data files.
-- **Ring buffer drops under sustained overload.** If the OLTP commit rate exceeds the bgworker's write throughput for long enough to fill the 32 MB ring, DML batches are silently dropped. The drop count is exposed via a GUC counter. Size the ring and tune flush parameters for the expected workload.
+- **Ring buffer drops under sustained overload.** If the OLTP commit rate exceeds the bgworker's write throughput for long enough to fill the 32 MB ring, a committing transaction's lake update is dropped as a whole (never partially); the session gets a `WARNING` and the bgworker logs the drop count. Size the ring and tune flush parameters for the expected workload.
 - **No replication.** The extension writes to the local warehouse only. HA/replication of the warehouse is the responsibility of the storage layer (S3 versioning, HDFS replication).
 - **Avro schema metadata.** Manifest files embed schema using a custom Avro-compatible encoding compatible with Paimon 1.4+.
 

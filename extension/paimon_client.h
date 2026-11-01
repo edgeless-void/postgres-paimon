@@ -3,11 +3,18 @@
 /*
  * paimon_client.h — per-backend row accumulator + ring-buffer producer.
  *
- * DML path: rows are buffered per-relation in PaimonRelBuffer until transaction
- * commit.  At commit the entire batch is serialised and pushed into the
- * shared-memory ring buffer (non-blocking; full ring → message dropped).
+ * Everything a transaction does to paimon_heap tables — DML rows and DDL
+ * events alike — is queued in process-local memory and only reaches the
+ * shared-memory ring at COMMIT, in the order it happened.  On ABORT (or
+ * ROLLBACK TO SAVEPOINT) the queued work is discarded, so the lake never
+ * sees changes that PostgreSQL rolled back.
  *
- * DDL path: messages are sent to the ring immediately (fire-and-forget).
+ * DML rows are first collected per relation in PaimonRelBuffer.  Whenever
+ * ordering matters (a DDL event is queued, a savepoint starts, the relation's
+ * schema changes) the buffered rows are "spilled": serialised into the
+ * ordered per-transaction message list txn_msgs_.  At PRE_COMMIT the
+ * remaining rows are spilled and a SYNC is appended; at COMMIT the whole list
+ * is written to the ring in one all-or-nothing operation.
  */
 
 #ifdef __cplusplus
@@ -15,6 +22,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 
 #include "paimon_event.h"
@@ -38,7 +46,7 @@ struct PaimonRow {
 
 struct PaimonRelBuffer {
     uint32_t    table_oid    = 0;
-    std::string table_name;
+    std::string table_name;          /* wire identifier, see paimon_event.h */
     uint32_t    schema_version = 0;
     std::vector<PaimonRow>     rows;
     size_t      byte_size    = 0;
@@ -54,7 +62,7 @@ public:
     bool connect();
     bool isConnected() const { return connected_; }
 
-    /* Buffer a DML row (accumulates until flushAll). */
+    /* Buffer a DML row (accumulates until commit). */
     void bufferRow(uint32_t table_oid,
                    const std::string& table_name,
                    uint32_t schema_version,
@@ -68,70 +76,77 @@ public:
                    const std::vector<std::string>& values);
 
     /*
-     * Serialise buffered rows into pending_msgs_ and write a WAL record when
-     * paimon_heap.wal_level = 'local'.  Must be called at XACT_EVENT_PRE_COMMIT
-     * so the WAL record is included in the transaction's commit flush.
+     * Row marks: rowMark() returns the number of rows currently buffered for
+     * a relation; truncateRows() drops rows buffered after that mark.  Used
+     * to retract a before-image when the heap UPDATE/DELETE did not happen
+     * (TM_Updated / TM_Deleted / ...).
+     */
+    size_t rowMark(uint32_t table_oid) const;
+    void   truncateRows(uint32_t table_oid, size_t mark);
+
+    /*
+     * Queue the relation's full current schema (PMSG_DDL_CREATE).  The
+     * bgworker creates the Paimon table if needed, otherwise reconciles its
+     * schema to this one (add / drop / rename / retype by field id).
+     */
+    void queueSchema(uint32_t table_oid,
+                     const std::string& table_name,
+                     uint32_t schema_version,
+                     const std::vector<PaimonColumn>& cols,
+                     const std::vector<uint16_t>& pk_attnums);
+    void queueTruncate(uint32_t table_oid, const std::string& table_name);
+    void queueDropTable(uint32_t table_oid, const std::string& table_name);
+
+    /* True when this transaction has anything queued for the lake. */
+    bool hasPending() const;
+
+    /* Subtransaction boundaries (SAVEPOINT / RELEASE / ROLLBACK TO). */
+    void startSubXact(uint32_t subid);
+    void commitSubXact(uint32_t subid);
+    void abortSubXact(uint32_t subid);
+
+    /*
+     * Spill buffered rows, append SYNC, and write a WAL record when
+     * paimon_heap.wal_level = 'local'.  Must be called at
+     * XACT_EVENT_PRE_COMMIT so the WAL record is included in the
+     * transaction's commit flush.
      */
     void prepareCommit();
 
-    /* Push pending_msgs_ to the ring buffer (call at XACT_EVENT_COMMIT). */
+    /* Push the prepared messages to the ring (call at XACT_EVENT_COMMIT). */
     void flushAll();
 
-    /* Discard buffered rows without sending (call at ABORT). */
+    /* Discard everything queued by this transaction (call at ABORT). */
     void discardAll();
-
-    /* DDL — fire-and-forget to ring. Returns "" on success. */
-    std::string ddlCreate(uint32_t table_oid,
-                          const std::string& table_name,
-                          const std::vector<PaimonColumn>& cols,
-                          const std::vector<uint16_t>& pk_attnums);
-    std::string ddlAddColumn(uint32_t table_oid, const PaimonColumn& col);
-    std::string ddlDropColumn(uint32_t table_oid, uint16_t attnum);
-    std::string ddlRenameColumn(uint32_t table_oid, uint16_t attnum,
-                                const std::string& new_name);
-    std::string ddlTypeChange(uint32_t table_oid, uint16_t attnum,
-                              PaimonTypeCode new_type, uint32_t new_typmod);
-    std::string ddlTruncate(uint32_t table_oid, const std::string& table_name);
-    std::string ddlDropTable(uint32_t table_oid, const std::string& table_name);
-    /* PK changes are always blocked (returns non-empty error). */
-    std::string ddlPkChange(uint32_t table_oid, const std::string& table_name);
 
 private:
     PaimonClient() = default;
     ~PaimonClient();
 
-    bool sendToRing(const std::string& msg);
-    void flushBuffer(PaimonRelBuffer& buf);
-    void ensureSchema(PaimonRelBuffer& buf);
+    void spillBuffer(uint32_t oid, PaimonRelBuffer& buf);
+    void spillAll();
+    uint32_t knownSchema(uint32_t oid, bool *found) const;
     std::string makeSchemaMsg(const PaimonRelBuffer& buf) const;
     std::string makeBatchMsg(const PaimonRelBuffer& buf) const;
 
     bool connected_ = false;
     std::unordered_map<uint32_t, PaimonRelBuffer> buffers_;
-    std::unordered_map<uint32_t, uint32_t>        sent_schema_version_;
-    std::vector<std::string>                      pending_msgs_;
+
+    /* Ordered messages queued by the current transaction. */
+    std::vector<std::string> txn_msgs_;
+    /* Messages built at PRE_COMMIT, written to the ring at COMMIT. */
+    std::vector<std::string> pending_msgs_;
+
+    /*
+     * Schema versions known to have reached the bgworker (committed), and
+     * the versions emitted by the current transaction (merged on commit).
+     */
+    std::unordered_map<uint32_t, uint32_t> sent_schema_version_;
+    std::unordered_map<uint32_t, uint32_t> txn_schema_version_;
+    std::unordered_set<uint32_t>           txn_dropped_;
+
+    /* Savepoint stack: (subxact id, txn_msgs_ length at its start). */
+    std::vector<std::pair<uint32_t, size_t>> subxact_marks_;
 };
 
-extern "C" {
 #endif /* __cplusplus */
-
-int  paimon_client_ddl_pk_change(uint32_t table_oid, const char* table_name,
-                                 char* err_buf, int err_buf_size);
-int  paimon_client_ddl_add_col(uint32_t table_oid, uint16_t attnum,
-                               uint8_t type_code, uint32_t typmod,
-                               uint8_t not_null, const char* col_name);
-int  paimon_client_ddl_drop_col(uint32_t table_oid, uint16_t attnum);
-int  paimon_client_ddl_rename(uint32_t table_oid, uint16_t attnum,
-                              const char* new_name);
-int  paimon_client_ddl_type_change(uint32_t table_oid, uint16_t attnum,
-                                   uint8_t new_type_code, uint32_t new_typmod);
-int  paimon_client_ddl_truncate(uint32_t table_oid, const char* table_name);
-int  paimon_client_ddl_drop_table(uint32_t table_oid, const char* table_name);
-
-void paimon_client_prepare_commit(void);
-void paimon_client_flush_all(void);
-void paimon_client_discard_all(void);
-
-#ifdef __cplusplus
-} /* extern "C" */
-#endif

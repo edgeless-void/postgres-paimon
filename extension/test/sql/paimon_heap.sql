@@ -2,7 +2,7 @@
 -- Run with: make installcheck PGUSER=<superuser>
 -- Requires: shared_preload_libraries = 'paimon_heap' in postgresql.conf
 
-SET paimon_heap.warehouse = '/tmp/paimon-regress-warehouse';
+-- (paimon_heap.warehouse is PGC_SIGHUP: set it in postgresql.conf, not here)
 
 -- 0. Access method is registered
 SELECT amname FROM pg_am WHERE amname = 'paimon_heap';
@@ -44,7 +44,8 @@ DROP TABLE t2;
 -- 3. DDL: column add / drop
 CREATE TABLE t3 (id int, a text) USING paimon_heap;
 INSERT INTO t3 VALUES (1, 'x');
-ALTER TABLE t3 ADD COLUMN b int DEFAULT 42;
+ALTER TABLE t3 ADD COLUMN b int;
+UPDATE t3 SET b = 42;
 SELECT * FROM t3 ORDER BY id;
 ALTER TABLE t3 DROP COLUMN a;
 SELECT * FROM t3 ORDER BY id;
@@ -55,3 +56,42 @@ CREATE TABLE t4 (id serial, v text) USING paimon_heap;
 INSERT INTO t4 (v) VALUES ('one'), ('two'), ('three');
 SELECT v FROM t4 ORDER BY id;
 DROP TABLE t4;
+
+-- 5. Operations blocked because the lake cannot follow them
+CREATE TABLE t5 (id int PRIMARY KEY, v text) USING paimon_heap;
+ALTER TABLE t5 ADD COLUMN d int DEFAULT 1;
+ALTER TABLE t5 ADD PRIMARY KEY (v);
+ALTER TABLE t5 RENAME TO t5_renamed;
+CREATE SCHEMA s5;
+ALTER TABLE t5 SET SCHEMA s5;
+CREATE TABLE s5.t5b (id int) USING paimon_heap;
+ALTER SCHEMA s5 RENAME TO s5_renamed;
+BEGIN;
+INSERT INTO t5 VALUES (1, 'one');
+PREPARE TRANSACTION 'paimon_regress';
+-- renaming a column is fine
+ALTER TABLE t5 RENAME COLUMN v TO val;
+INSERT INTO t5 VALUES (2, 'two');
+SELECT * FROM t5 ORDER BY id;
+DROP SCHEMA s5 CASCADE;
+DROP TABLE t5;
+
+-- 6. Rolled-back DDL / savepoints leave the table intact and writable
+CREATE TABLE t6 (id int PRIMARY KEY, x int) USING paimon_heap;
+INSERT INTO t6 VALUES (1, 10);
+BEGIN;
+DROP TABLE t6;
+ROLLBACK;
+BEGIN;
+TRUNCATE t6;
+ALTER TABLE t6 DROP COLUMN x;
+ROLLBACK;
+BEGIN;
+INSERT INTO t6 VALUES (2, 20);
+SAVEPOINT sp;
+INSERT INTO t6 VALUES (3, 30);
+ROLLBACK TO sp;
+INSERT INTO t6 VALUES (4, 40);
+COMMIT;
+SELECT * FROM t6 ORDER BY id;
+DROP TABLE t6;

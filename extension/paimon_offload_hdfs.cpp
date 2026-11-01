@@ -5,11 +5,14 @@
  * libhdfs3 is a native C++ HDFS client (no JVM) that speaks the Hadoop RPC
  * wire protocol directly.  We use only the stable C API (<hdfs/hdfs.h>).
  *
- * Sync semantics match the S3 implementation:
- *   - Walk the local table directory tree recursively.
- *   - For each file: call hdfsGetPathInfo(); skip if remote size == local size.
+ * Sync semantics match the S3 implementation (paimon_offload_common.h):
+ *   - Upload bottom-up: data, manifests, schema, snapshots, LATEST last; a
+ *     phase only starts when the previous phases fully succeeded.
+ *   - Skip unchanged files: size check for UUID-named files, byte-for-byte
+ *     comparison for schema-N / snapshot-N (names reused after DROP TABLE).
  *   - Upload missing / changed files with hdfsOpenFile(O_WRONLY) + hdfsWrite().
- *   - On full success, remove local .parquet files.
+ *   - Local .parquet files are removed by the caller once every configured
+ *     target has them.
  *
  * Kerberos
  * --------
@@ -28,6 +31,7 @@
  */
 
 #include "paimon_offload_hdfs.h"
+#include "paimon_offload_common.h"
 
 #include <filesystem>
 #include <fstream>
@@ -190,15 +194,37 @@ connect_hdfs(const HdfsConfig &cfg)
 
 /* ── Upload helpers ─────────────────────────────────────────────────────── */
 
-/* Returns true if the remote file already has exactly expected_size bytes. */
+/*
+ * True if the remote file already holds this local file: same size and, with
+ * check_content, the same bytes (only used for small metadata files).
+ */
 static bool
-remote_file_matches(hdfsFS fsh, const std::string &path, int64_t expected_size)
+remote_file_matches(hdfsFS fsh, const std::string &path,
+                    const fs::path &local_path, int64_t expected_size,
+                    bool check_content)
 {
     hdfsFileInfo *info = hdfsGetPathInfo(fsh, path.c_str());
     if (!info) return false;
     bool match = (info->mSize == (tOffset)expected_size);
     hdfsFreeFileInfo(info, 1);
-    return match;
+    if (!match || !check_content) return match;
+
+    std::ifstream in(local_path, std::ios::binary);
+    if (!in.is_open()) return false;
+    std::string local((std::istreambuf_iterator<char>(in)),
+                      std::istreambuf_iterator<char>());
+
+    hdfsFile rf = hdfsOpenFile(fsh, path.c_str(), O_RDONLY, 0, 0, 0);
+    if (!rf) return false;
+    std::string remote(local.size(), '\0');
+    size_t got = 0;
+    while (got < remote.size()) {
+        tSize n = hdfsRead(fsh, rf, &remote[got], (tSize)(remote.size() - got));
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    hdfsCloseFile(fsh, rf);
+    return got == local.size() && remote == local;
 }
 
 /* Create remote directory (and all parents) idempotently. */
@@ -271,49 +297,76 @@ put_file(hdfsFS fsh, const std::string &remote_path, const fs::path &local_path)
 
 bool
 hdfs_upload_table(const HdfsConfig     &cfg,
-                  const std::string    &ware_dir,
-                  const std::string    &table_name)
+                  const std::string    &local_root_str,
+                  const std::string    &remote_rel)
 {
     if (cfg.base_path.empty()) return true;
 
-    fs::path local_root = fs::path(ware_dir) / table_name;
+    fs::path local_root(local_root_str);
     std::error_code ec;
     if (!fs::exists(local_root, ec)) return true;
 
     hdfsFS fsh = connect_hdfs(cfg);
     if (!fsh) return false;
 
-    std::string remote_root = cfg.base_path + "/" + table_name;
+    std::string remote_root = offload_join(cfg.base_path, remote_rel);
     ensure_dir(fsh, remote_root);
 
     bool all_ok = true;
-    std::vector<fs::path> uploaded_parquets;
+    int  phase  = -1;
 
-    for (const auto &entry :
-         fs::recursive_directory_iterator(local_root, ec)) {
-        if (!entry.is_regular_file()) continue;
-
-        fs::path rel        = fs::relative(entry.path(), local_root, ec);
-        std::string remote  = remote_root + "/" + rel.generic_string();
-        int64_t     size    = (int64_t)entry.file_size(ec);
-
-        if (remote_file_matches(fsh, remote, size)) continue;
-
-        if (put_file(fsh, remote, entry.path())) {
-            if (entry.path().extension() == ".parquet")
-                uploaded_parquets.push_back(entry.path());
-        } else {
-            all_ok = false;
+    for (const auto &f : offload_collect(local_root)) {
+        if (f.phase != phase) {
+            /* Never publish metadata on top of a failed lower layer. */
+            if (!all_ok) break;
+            phase = f.phase;
         }
+
+        std::string remote = remote_root + "/" + f.rel;
+        int64_t     size   = (int64_t)fs::file_size(f.local, ec);
+        if (ec) { all_ok = false; continue; }
+
+        if (f.phase != OFFLOAD_POINTER &&
+            remote_file_matches(fsh, remote, f.local, size, f.name_reused))
+            continue;
+
+        if (!put_file(fsh, remote, f.local))
+            all_ok = false;
     }
 
     hdfsDisconnect(fsh);
 
-    if (all_ok) {
-        for (const auto &p : uploaded_parquets)
-            fs::remove(p, ec);
-    }
+    if (!all_ok)
+        ereport(WARNING,
+                errmsg("paimon_hdfs: sync of %s incomplete; "
+                       "will retry on the next flush", remote_root.c_str()));
     return all_ok;
+}
+
+bool
+hdfs_drop_table_metadata(const HdfsConfig &cfg, const std::string &remote_rel)
+{
+    if (cfg.base_path.empty()) return true;
+
+    hdfsFS fsh = connect_hdfs(cfg);
+    if (!fsh) return false;
+
+    std::string remote_root = offload_join(cfg.base_path, remote_rel);
+    bool ok = true;
+    /* snapshot/ first: once LATEST is gone readers stop seeing the table. */
+    for (const auto &dir : offload_metadata_dirs()) {
+        std::string p = remote_root + "/" + dir;
+        if (hdfsExists(fsh, p.c_str()) != 0)
+            continue;
+        if (hdfsDelete(fsh, p.c_str(), /*recursive=*/1) != 0) {
+            ereport(WARNING,
+                    errmsg("paimon_hdfs: cannot delete %s: %s",
+                           p.c_str(), hdfsGetLastError()));
+            ok = false;
+        }
+    }
+    hdfsDisconnect(fsh);
+    return ok;
 }
 
 } // namespace paimon

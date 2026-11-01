@@ -76,11 +76,39 @@ void PaimonTableWriter::rebuildManifestsFromDisk() {
 
     collect(read_field("baseManifestList"));
     collect(read_field("deltaManifestList"));
+
+    /* Restore the running record count so the next snapshot's
+       totalRecordCount continues from the committed state. */
+    {
+        fs::path p = fs::path(root_) / "snapshot" /
+                     ("snapshot-" + std::to_string(snap_id));
+        std::ifstream f(p);
+        std::string json((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        auto pos = json.find("\"totalRecordCount\"");
+        if (pos != std::string::npos) {
+            pos = json.find(':', pos);
+            if (pos != std::string::npos) {
+                try { total_record_count_ = std::stoll(json.substr(pos + 1)); }
+                catch (...) {}
+            }
+        }
+    }
 }
 
 bool PaimonTableWriter::initSchema(const std::vector<FieldDef>& fields,
                                     const std::vector<std::string>& pk_names) {
+    /*
+     * Existing table: if the incoming schema differs, the rows buffered so
+     * far were captured under the current schema — write them out first.
+     */
+    if (schema_mgr_.exists() && schema_mgr_.reconcile(fields, pk_names, true))
+        flush();
     return schema_mgr_.bootstrap(fields, pk_names);
+}
+
+bool PaimonTableWriter::hasSchema() const {
+    return schema_mgr_.exists();
 }
 
 void PaimonTableWriter::ensureColBuf(uint16_t attnum, PaimonTypeCode tc,
@@ -304,6 +332,14 @@ bool PaimonTableWriter::truncate() {
     rk_buf_.clear(); seq_buf_.clear(); col_buf_.clear(); buf_rows_ = 0;
     total_record_count_ = 0;
 
+    /*
+     * Pre-truncate manifests must not be carried into the next snapshot's
+     * baseManifestList, or the truncated rows reappear on the next flush.
+     */
+    committed_manifests_.clear();
+
+    if (!schema_mgr_.exists()) return true;   /* nothing in the lake yet */
+
     /* Write an empty snapshot (no delta files, TRUNCATE kind) */
     /* We use a manifest-list pointing to an empty manifest file */
     std::string manifest_dir = root_ + "/manifest";
@@ -343,6 +379,9 @@ bool PaimonTableWriter::truncate() {
     fs::rename(snap_dir / "LATEST.tmp", snap_dir / "LATEST");
 
     latest_snapshot_id_ = new_id;
+
+    /* The TRUNCATE snapshot's delta manifest is the new (empty) baseline. */
+    committed_manifests_.push_back({manifest_name, 0, sv.id});
     return true;
 }
 
@@ -356,6 +395,7 @@ bool PaimonTableWriter::drop() {
 bool PaimonTableWriter::dropMetadataOnly() {
     rk_buf_.clear(); seq_buf_.clear(); col_buf_.clear(); buf_rows_ = 0;
     latest_snapshot_id_ = -1;
+    total_record_count_ = 0;
     committed_manifests_.clear();
     std::error_code ec;
     fs::remove_all(fs::path(root_) / "schema",   ec);

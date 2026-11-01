@@ -23,12 +23,17 @@ struct HdfsConfig {
     std::string krb_keytab;     // absolute path to keytab file
 };
 
-// Sync local_dir/<table_name>/ → hdfs://<namenode>/<base_path>/<table_name>/
-// Skips files already on HDFS with the same byte length (GETFILESTATUS check).
-// After a successful sync, removes local .parquet files from bucket-0/.
-// Returns true on success; logs WARNING and returns false on error.
+// Sync the local table directory local_root →
+// hdfs://<namenode>/<base_path>/<remote_rel>/ bottom-up (data, manifests,
+// schema, snapshots, LATEST last), skipping files that are already identical.
+// Does not delete local files.  Returns true when everything is in sync;
+// logs WARNING and returns false otherwise (the next call retries).
 bool hdfs_upload_table(const HdfsConfig  &cfg,
-                       const std::string &ware_dir,
-                       const std::string &table_name);
+                       const std::string &local_root,
+                       const std::string &remote_rel);
+
+// DROP TABLE: remove snapshot/, manifest/ and schema/ under
+// <base_path>/<remote_rel>/.  Data files are left in place.
+bool hdfs_drop_table_metadata(const HdfsConfig &cfg, const std::string &remote_rel);
 
 } // namespace paimon

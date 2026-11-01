@@ -75,6 +75,12 @@ public:
     bool dropMetadataOnly();
 
     const std::string &tableName() const { return name_; }
+    const std::string &root() const { return root_; }
+
+    /* True once the table has a schema (on disk). */
+    bool hasSchema() const;
+    /* Current schema id (-1 if none). */
+    int64_t schemaId() const { return hasSchema() ? schema_mgr_.current().id : -1; }
 
 private:
     std::string             root_;

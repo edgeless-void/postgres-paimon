@@ -21,7 +21,7 @@ EXTENSION  = paimon_heap
 DATA       = paimon_heap--1.0.sql
 
 REGRESS      = paimon_heap
-REGRESS_OPTS = --inputdir=test
+REGRESS_OPTS = --inputdir=test --load-extension=paimon_heap
 
 AWS_SDK_ROOT     ?= /opt/aws-sdk-cpp
 HDFS3_ROOT       ?= /usr/local

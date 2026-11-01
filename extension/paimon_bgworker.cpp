@@ -6,8 +6,15 @@
  * ring buffer and dispatches each framed message to a PaimonTableWriter,
  * which writes Parquet files to the staging directory.
  *
- * After each SYNC the bgworker optionally promotes completed staging files
- * to the warehouse directory (rename on same FS, or copy + delete).
+ * After each flush the bgworker promotes the table from the staging directory
+ * to the warehouse directory (data files moved, metadata copied, LATEST
+ * last) and then offloads the warehouse copy to S3 / HDFS.
+ *
+ * Lake location of a PostgreSQL table <schema>.<table>:
+ *   local:   <warehouse>/<db>.db/<table>      db = "default" for schema public,
+ *                                             otherwise the schema name
+ *   S3/HDFS: <prefix>/<table>                 for db "default" (unchanged layout)
+ *            <prefix>/<db>.db/<table>         otherwise
  *
  * GUCs consumed (all PGC_SIGHUP so pg_reload_conf() picks them up):
  *   paimon_heap.warehouse   — final warehouse root  (default /tmp/paimon-warehouse)
@@ -26,11 +33,14 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdio>
+#include <fstream>
 
 #include "paimon_event.h"        /* pure-C header, safe first */
 #include "paimon_table_writer.h" /* pulls in Arrow/Parquet */
 #include "paimon_offload_s3.h"
 #include "paimon_offload_hdfs.h"
+#include "paimon_offload_common.h"
+#include <unordered_set>
 
 /* PostgreSQL headers after C++ headers. */
 extern "C" {
@@ -94,8 +104,24 @@ static uint32_t g_pending_txns    = 0;
 static uint64_t g_pending_rows    = 0;
 static time_t   g_last_flush_time = 0;
 
-static std::unordered_map<uint32_t,
-    std::unique_ptr<paimon::PaimonTableWriter>> g_tables;
+/* One lake table per PostgreSQL relation OID. */
+struct TableEntry {
+    std::unique_ptr<paimon::PaimonTableWriter> writer;
+    std::string db;      /* Paimon database ("default" = schema public) */
+    std::string table;   /* table name */
+
+    /* Path below the warehouse / staging root. */
+    std::string local_rel() const { return db + ".db/" + table; }
+    /* Path below the S3 prefix / HDFS base path. */
+    std::string remote_rel() const {
+        return db == "default" ? table : db + ".db/" + table;
+    }
+};
+
+static std::unordered_map<uint32_t, TableEntry> g_tables;
+
+/* OIDs we already warned about (DML for a table without a lake schema). */
+static std::unordered_set<uint32_t> g_warned_no_schema;
 
 static std::string effective_warehouse(void) {
     if (guc_warehouse && guc_warehouse[0])
@@ -104,9 +130,9 @@ static std::string effective_warehouse(void) {
 }
 
 /* Paimon FileSystemCatalog stores tables at warehouse/<db>.db/table
-   (Hive-style database directories with a .db suffix).
-   We always use "default.db" to match Spark's paimon.default catalog. */
-static const char *PAIMON_DB = "default.db";
+   (Hive-style database directories with a .db suffix).  PostgreSQL schema
+   "public" maps to Spark's paimon.default database. */
+static const char *PAIMON_DEFAULT_DB = "default";
 
 static std::string effective_staging(void) {
     if (guc_staging_dir && guc_staging_dir[0])
@@ -145,86 +171,199 @@ struct Cursor {
 };
 
 /* ── Table accessor ──────────────────────────────────────────────── */
-static paimon::PaimonTableWriter *
-get_or_create(uint32_t oid, const std::string &name)
+
+/* Wire identifier "<db>\0<table>"; a bare name (older messages) = default db. */
+static void
+split_ident(const std::string &ident, std::string &db, std::string &table)
+{
+    auto z = ident.find('\0');
+    if (z == std::string::npos) {
+        db    = PAIMON_DEFAULT_DB;
+        table = ident;
+    } else {
+        db    = ident.substr(0, z);
+        table = ident.substr(z + 1);
+    }
+    if (db.empty()) db = PAIMON_DEFAULT_DB;
+}
+
+static TableEntry *
+find_table(uint32_t oid)
 {
     auto it = g_tables.find(oid);
-    if (it != g_tables.end()) return it->second.get();
+    return it == g_tables.end() ? nullptr : &it->second;
+}
 
-    std::string staging_root = effective_staging() + "/" + PAIMON_DB + "/" + name;
-    auto w = std::make_unique<paimon::PaimonTableWriter>(staging_root, name);
-    auto *ptr = w.get();
-    g_tables[oid] = std::move(w);
-    return ptr;
+/*
+ * Look up the writer for oid, opening it from disk if this bgworker has not
+ * seen the table yet (e.g. after a restart): the writer loads the schema,
+ * latest snapshot and manifest list from the staging directory.
+ */
+static TableEntry *
+get_or_create(uint32_t oid, const std::string &ident)
+{
+    if (TableEntry *e = find_table(oid)) return e;
+    if (ident.empty()) return nullptr;
+
+    TableEntry e;
+    split_ident(ident, e.db, e.table);
+    if (e.table.empty()) return nullptr;
+
+    std::string staging_root = effective_staging() + "/" + e.local_rel();
+    e.writer = std::make_unique<paimon::PaimonTableWriter>(staging_root, e.table);
+    auto res = g_tables.emplace(oid, std::move(e));
+    return &res.first->second;
 }
 
 /* ── Offload helpers ─────────────────────────────────────────────── */
 
-static void
-offload_table(const std::string &ware_dir, const std::string &tname)
-{
-    /* S3 offload */
-    if (guc_s3_bucket && guc_s3_bucket[0]) {
-        paimon::S3Config s3;
-        s3.bucket   = guc_s3_bucket;
-        if (guc_s3_prefix   && guc_s3_prefix[0])   s3.prefix   = guc_s3_prefix;
-        if (guc_s3_region   && guc_s3_region[0])   s3.region   = guc_s3_region;
-        if (guc_s3_endpoint && guc_s3_endpoint[0]) s3.endpoint = guc_s3_endpoint;
-        paimon::s3_upload_table(s3, ware_dir, tname);
-    }
+static bool
+s3_configured(void)   { return guc_s3_bucket && guc_s3_bucket[0]; }
+static bool
+hdfs_configured(void) { return guc_hdfs_path && guc_hdfs_path[0]; }
 
-    /* HDFS offload */
-    if (guc_hdfs_path && guc_hdfs_path[0]) {
-        paimon::HdfsConfig hdfs;
-        if (guc_hdfs_namenode      && guc_hdfs_namenode[0])
-            hdfs.namenode       = guc_hdfs_namenode;
-        hdfs.use_https          = guc_hdfs_use_https;
-        hdfs.base_path          = guc_hdfs_path;
-        if (guc_hdfs_user         && guc_hdfs_user[0])
-            hdfs.user           = guc_hdfs_user;
-        if (guc_hdfs_conf_dir     && guc_hdfs_conf_dir[0])
-            hdfs.conf_dir       = guc_hdfs_conf_dir;
-        if (guc_hdfs_krb_principal && guc_hdfs_krb_principal[0])
-            hdfs.krb_principal  = guc_hdfs_krb_principal;
-        if (guc_hdfs_krb_keytab   && guc_hdfs_krb_keytab[0])
-            hdfs.krb_keytab     = guc_hdfs_krb_keytab;
-        paimon::hdfs_upload_table(hdfs, ware_dir, tname);
-    }
+static paimon::S3Config
+s3_config(void)
+{
+    paimon::S3Config s3;
+    s3.bucket   = guc_s3_bucket;
+    if (guc_s3_prefix   && guc_s3_prefix[0])   s3.prefix   = guc_s3_prefix;
+    if (guc_s3_region   && guc_s3_region[0])   s3.region   = guc_s3_region;
+    if (guc_s3_endpoint && guc_s3_endpoint[0]) s3.endpoint = guc_s3_endpoint;
+    return s3;
+}
+
+static paimon::HdfsConfig
+hdfs_config(void)
+{
+    paimon::HdfsConfig hdfs;
+    if (guc_hdfs_namenode      && guc_hdfs_namenode[0])
+        hdfs.namenode       = guc_hdfs_namenode;
+    hdfs.use_https          = guc_hdfs_use_https;
+    hdfs.base_path          = guc_hdfs_path;
+    if (guc_hdfs_user         && guc_hdfs_user[0])
+        hdfs.user           = guc_hdfs_user;
+    if (guc_hdfs_conf_dir     && guc_hdfs_conf_dir[0])
+        hdfs.conf_dir       = guc_hdfs_conf_dir;
+    if (guc_hdfs_krb_principal && guc_hdfs_krb_principal[0])
+        hdfs.krb_principal  = guc_hdfs_krb_principal;
+    if (guc_hdfs_krb_keytab   && guc_hdfs_krb_keytab[0])
+        hdfs.krb_keytab     = guc_hdfs_krb_keytab;
+    return hdfs;
+}
+
+/*
+ * Sync the warehouse copy of a table to every configured remote target.
+ * Local data files are removed only once *all* targets have them — removing
+ * them after the first target (as each target used to do by itself) left
+ * the second target without the data.
+ */
+static void
+offload_table(const TableEntry &e)
+{
+    if (!s3_configured() && !hdfs_configured())
+        return;
+
+    std::string local_root = effective_warehouse() + "/" + e.local_rel();
+    bool all_ok = true;
+
+    if (s3_configured() &&
+        !paimon::s3_upload_table(s3_config(), local_root, e.remote_rel()))
+        all_ok = false;
+
+    if (hdfs_configured() &&
+        !paimon::hdfs_upload_table(hdfs_config(), local_root, e.remote_rel()))
+        all_ok = false;
+
+    if (!all_ok)
+        return;
+
+    std::error_code ec;
+    for (const auto &f : paimon::offload_collect(local_root))
+        if (f.phase == paimon::OFFLOAD_DATA &&
+            f.local.extension() == ".parquet")
+            fs::remove(f.local, ec);
+}
+
+static bool
+same_file_content(const fs::path &a, const fs::path &b)
+{
+    std::error_code ec;
+    if (!fs::exists(b, ec)) return false;
+    if (fs::file_size(a, ec) != fs::file_size(b, ec)) return false;
+    std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+    std::string ca((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
+    std::string cb((std::istreambuf_iterator<char>(fb)), std::istreambuf_iterator<char>());
+    return ca == cb;
+}
+
+/* Copy src → dst atomically (tmp + rename). */
+static bool
+copy_atomic(const fs::path &src, const fs::path &dst)
+{
+    std::error_code ec;
+    fs::create_directories(dst.parent_path(), ec);
+    fs::path tmp = dst;
+    tmp += ".tmp";
+    fs::copy_file(src, tmp, fs::copy_options::overwrite_existing, ec);
+    if (ec) return false;
+    fs::rename(tmp, dst, ec);
+    return !ec;
 }
 
 /* ── Promote staging → warehouse ────────────────────────────────── */
 /*
- * After each SYNC we move any new Parquet files from staging_dir to
- * warehouse dir.  When staging == warehouse this is a no-op.
+ * When staging_dir differs from the warehouse, bring the warehouse copy of
+ * the table up to date: data files are moved, metadata files (which the
+ * writer keeps reading from staging) are copied, bottom-up with LATEST last
+ * so a reader of the warehouse never sees a snapshot whose files are not
+ * there yet.  Then offload the warehouse copy to S3 / HDFS.
  */
 static void
-promote_table(const std::string &tname)
+promote_table(const TableEntry &e)
 {
     std::string staging_dir = effective_staging();
     std::string ware_dir    = effective_warehouse();
 
-    /* Move files from staging → warehouse only when they're different dirs. */
     if (staging_dir != ware_dir) {
-        fs::path src_dir = fs::path(staging_dir) / PAIMON_DB / tname / "bucket-0";
-        fs::path dst_dir = fs::path(ware_dir)    / PAIMON_DB / tname / "bucket-0";
+        fs::path src_root = fs::path(staging_dir) / e.local_rel();
+        fs::path dst_root = fs::path(ware_dir)    / e.local_rel();
+        bool ok = true;
+        int  phase = -1;
 
-        std::error_code ec;
-        fs::create_directories(dst_dir, ec);
-
-        for (auto &de : fs::directory_iterator(src_dir, ec)) {
-            if (!de.is_regular_file()) continue;
-            fs::path dst = dst_dir / de.path().filename();
-            fs::rename(de.path(), dst, ec);
-            if (ec) {
-                fs::copy_file(de.path(), dst,
-                              fs::copy_options::overwrite_existing, ec);
-                if (!ec) fs::remove(de.path(), ec);
+        for (const auto &f : paimon::offload_collect(src_root)) {
+            if (f.phase != phase) {
+                if (!ok) break;
+                phase = f.phase;
             }
+            fs::path dst = dst_root / f.rel;
+            std::error_code ec;
+
+            if (f.phase == paimon::OFFLOAD_DATA) {
+                fs::create_directories(dst.parent_path(), ec);
+                fs::rename(f.local, dst, ec);
+                if (ec) {
+                    ec.clear();
+                    if (copy_atomic(f.local, dst)) fs::remove(f.local, ec);
+                    else ok = false;
+                }
+            } else if (f.phase == paimon::OFFLOAD_MANIFEST) {
+                if (!fs::exists(dst, ec) && !copy_atomic(f.local, dst))
+                    ok = false;
+            } else {
+                if (!same_file_content(f.local, dst) && !copy_atomic(f.local, dst))
+                    ok = false;
+            }
+        }
+        if (!ok) {
+            ereport(WARNING,
+                    errmsg("paimon_bgworker: promoting %s to the warehouse failed; "
+                           "will retry on the next flush", e.local_rel().c_str()));
+            return;
         }
     }
 
-    /* Offload to S3/HDFS regardless of staging configuration. */
-    offload_table(ware_dir + "/" + PAIMON_DB, tname);
+    offload_table(e);
 }
 
 /* ── Message handlers ────────────────────────────────────────────── */
@@ -255,11 +394,20 @@ handle_ddl_create(Cursor &c)
         for (const auto &f : fields)
             if (f.field_id == an) { pk_names.push_back(f.name); break; }
 
-    auto *tw = get_or_create(oid, tname);
-    try { tw->initSchema(fields, pk_names); }
-    catch (const std::exception &e) {
+    TableEntry *e = get_or_create(oid, tname);
+    if (!e) return;
+    try {
+        bool    had    = e->writer->hasSchema();
+        int64_t before = e->writer->schemaId();
+        e->writer->initSchema(fields, pk_names);
+        g_warned_no_schema.erase(oid);
+        /* Publish a new / changed schema right away. */
+        if (!had || e->writer->schemaId() != before)
+            promote_table(*e);
+    }
+    catch (const std::exception &ex) {
         ereport(WARNING, errmsg("paimon_bgworker: initSchema(%s): %s",
-                                tname.c_str(), e.what()));
+                                e->local_rel().c_str(), ex.what()));
     }
 }
 
@@ -267,15 +415,18 @@ handle_ddl_create(Cursor &c)
 static void
 do_flush_all(void)
 {
-    for (auto &[oid, tw] : g_tables) {
-        try { tw->flush(); }
-        catch (const std::exception &e) {
-            ereport(WARNING, errmsg("paimon_bgworker: flush: %s", e.what()));
+    for (auto &[oid, e] : g_tables) {
+        try { e.writer->flush(); }
+        catch (const std::exception &ex) {
+            ereport(WARNING, errmsg("paimon_bgworker: flush: %s", ex.what()));
         }
     }
-    for (auto &[oid, tw] : g_tables) {
-        try { promote_table(tw->tableName()); }
-        catch (...) {}
+    for (auto &[oid, e] : g_tables) {
+        try { promote_table(e); }
+        catch (const std::exception &ex) {
+            ereport(WARNING, errmsg("paimon_bgworker: promote %s: %s",
+                                    e.local_rel().c_str(), ex.what()));
+        }
     }
     g_pending_txns    = 0;
     g_pending_rows    = 0;
@@ -285,14 +436,26 @@ do_flush_all(void)
 static void
 handle_dml_batch(Cursor &c)
 {
-    uint32_t oid   = c.u32();
-    c.str();          /* table_name — already registered */
+    uint32_t    oid   = c.u32();
+    std::string tname = c.str();
     c.u32();          /* schema_version */
     uint32_t nrows = c.u32();
+    if (!c.ok()) return;
 
-    auto it = g_tables.find(oid);
-    paimon::PaimonTableWriter *tw =
-        (it != g_tables.end()) ? it->second.get() : nullptr;
+    /*
+     * Open the table from disk if needed: after a bgworker restart the
+     * backends do not re-send a schema they already delivered.
+     */
+    TableEntry *e = get_or_create(oid, tname);
+    paimon::PaimonTableWriter *tw = e ? e->writer.get() : nullptr;
+    if (tw && !tw->hasSchema()) {
+        if (g_warned_no_schema.insert(oid).second)
+            ereport(WARNING,
+                    errmsg("paimon_bgworker: no lake schema for relation %u (%s); "
+                           "discarding its rows until the schema arrives",
+                           oid, e->local_rel().c_str()));
+        tw = nullptr;
+    }
 
     for (uint32_t r = 0; r < nrows; ++r) {
         PaimonRowKind kind  = (PaimonRowKind)c.u8();
@@ -356,10 +519,10 @@ handle_ddl_add(Cursor &c)
     f.not_null  = (c.u8() != 0);
     f.name      = c.str();
     if (!c.ok()) return;
-    auto it = g_tables.find(oid);
-    if (it != g_tables.end()) {
-        it->second->ddlAddField(f);
-        promote_table(it->second->tableName());
+    /* Legacy message (pre-reconcile builds, recovery journal). */
+    if (TableEntry *e = find_table(oid)) {
+        e->writer->ddlAddField(f);
+        promote_table(*e);
     }
 }
 
@@ -369,10 +532,10 @@ handle_ddl_drop(Cursor &c)
     uint32_t oid    = c.u32();
     uint16_t attnum = c.u16();
     if (!c.ok()) return;
-    auto it = g_tables.find(oid);
-    if (it != g_tables.end()) {
-        it->second->ddlDropField(attnum);
-        promote_table(it->second->tableName());
+    /* Legacy message (pre-reconcile builds, recovery journal). */
+    if (TableEntry *e = find_table(oid)) {
+        e->writer->ddlDropField(attnum);
+        promote_table(*e);
     }
 }
 
@@ -383,10 +546,10 @@ handle_ddl_rename(Cursor &c)
     uint16_t    an   = c.u16();
     std::string name = c.str();
     if (!c.ok()) return;
-    auto it = g_tables.find(oid);
-    if (it != g_tables.end()) {
-        it->second->ddlRenameField(an, name);
-        promote_table(it->second->tableName());
+    /* Legacy message (pre-reconcile builds, recovery journal). */
+    if (TableEntry *e = find_table(oid)) {
+        e->writer->ddlRenameField(an, name);
+        promote_table(*e);
     }
 }
 
@@ -398,52 +561,70 @@ handle_ddl_type(Cursor &c)
     PaimonTypeCode tc     = (PaimonTypeCode)c.u8();
     uint32_t       typmod = c.u32();
     if (!c.ok()) return;
-    auto it = g_tables.find(oid);
-    if (it != g_tables.end()) {
-        it->second->ddlChangeType(an, tc, typmod);
-        promote_table(it->second->tableName());
+    /* Legacy message (pre-reconcile builds, recovery journal). */
+    if (TableEntry *e = find_table(oid)) {
+        e->writer->ddlChangeType(an, tc, typmod);
+        promote_table(*e);
     }
 }
 
 static void
 handle_ddl_truncate(Cursor &c)
 {
-    uint32_t oid = c.u32();
-    c.str();    /* table_name */
+    uint32_t    oid   = c.u32();
+    std::string tname = c.str();
     if (!c.ok()) return;
-    auto it = g_tables.find(oid);
-    if (it != g_tables.end()) it->second->truncate();
+    TableEntry *e = get_or_create(oid, tname);
+    if (!e) return;
+    e->writer->truncate();
+    /* Publish the empty snapshot to the warehouse / S3 / HDFS. */
+    promote_table(*e);
 }
 
+/*
+ * DROP TABLE: the lake table disappears everywhere — local staging,
+ * warehouse and S3/HDFS lose snapshot/, manifest/ and schema/, so readers no
+ * longer see the table and a re-created table with the same name starts from
+ * clean metadata.  Data files (bucket-N/) are left in place.  Rows still
+ * buffered for the table are discarded.
+ */
 static void
 handle_ddl_drop_table(Cursor &c)
 {
-    uint32_t oid = c.u32();
-    c.str();    /* table_name */
+    uint32_t    oid   = c.u32();
+    std::string tname = c.str();
     if (!c.ok()) return;
-    auto it = g_tables.find(oid);
-    if (it != g_tables.end()) {
-        /*
-         * Flush any buffered rows so they are not lost, then promote the
-         * final state to S3/HDFS.  After this the remote copy is complete
-         * and remains intact (metadata-only drop: we never delete from S3).
-         */
-        try { it->second->flush(); }
-        catch (const std::exception &e) {
-            ereport(WARNING, errmsg("paimon_bgworker: DROP TABLE flush: %s", e.what()));
-        }
-        try { promote_table(it->second->tableName()); }
-        catch (const std::exception &e) {
-            ereport(WARNING, errmsg("paimon_bgworker: DROP TABLE promote: %s", e.what()));
-        }
-        /*
-         * Remove only local metadata (schema/, snapshot/, manifest/).
-         * Local data files (bucket-0/) are left in place; S3/HDFS keeps the
-         * authoritative copy of everything.
-         */
-        it->second->dropMetadataOnly();
-        g_tables.erase(it);
+    TableEntry *e = get_or_create(oid, tname);
+    if (!e) return;
+
+    e->writer->dropMetadataOnly();
+
+    std::error_code ec;
+    if (effective_staging() != effective_warehouse()) {
+        fs::path ware_root = fs::path(effective_warehouse()) / e->local_rel();
+        for (const auto &dir : paimon::offload_metadata_dirs())
+            fs::remove_all(ware_root / dir, ec);
     }
+
+    try {
+        if (s3_configured() &&
+            !paimon::s3_drop_table_metadata(s3_config(), e->remote_rel()))
+            ereport(WARNING,
+                    errmsg("paimon_bgworker: DROP TABLE %s: S3 metadata not removed",
+                           e->local_rel().c_str()));
+        if (hdfs_configured() &&
+            !paimon::hdfs_drop_table_metadata(hdfs_config(), e->remote_rel()))
+            ereport(WARNING,
+                    errmsg("paimon_bgworker: DROP TABLE %s: HDFS metadata not removed",
+                           e->local_rel().c_str()));
+    }
+    catch (const std::exception &ex) {
+        ereport(WARNING, errmsg("paimon_bgworker: DROP TABLE %s: %s",
+                                e->local_rel().c_str(), ex.what()));
+    }
+
+    g_tables.erase(oid);
+    g_warned_no_schema.erase(oid);
 }
 
 /* ── Main dispatcher ─────────────────────────────────────────────── */
@@ -458,6 +639,12 @@ dispatch_message(const char *msg, size_t len)
     uint8_t  msg_type = data[0];
     Cursor c{ data + 1, data + plen };
 
+    /*
+     * C++ exceptions (filesystem, Arrow, ...) must not escape: PG_TRY in the
+     * main loop only catches ereport(ERROR), and an uncaught exception would
+     * terminate the process and force a crash restart of the whole cluster.
+     */
+    try {
     switch ((PaimonMsgType)msg_type) {
         case PMSG_DDL_CREATE:    handle_ddl_create(c);   break;
         case PMSG_DML_BATCH:     handle_dml_batch(c);    break;
@@ -472,6 +659,15 @@ dispatch_message(const char *msg, size_t len)
             ereport(DEBUG1, errmsg("paimon_bgworker: unknown msg_type %d",
                                    (int)msg_type));
             break;
+    }
+    }
+    catch (const std::exception &ex) {
+        ereport(WARNING, errmsg("paimon_bgworker: message type %d failed: %s",
+                                (int)msg_type, ex.what()));
+    }
+    catch (...) {
+        ereport(WARNING, errmsg("paimon_bgworker: message type %d failed",
+                                (int)msg_type));
     }
 }
 
@@ -587,17 +783,21 @@ paimon_bgworker_main(Datum arg)
     /* Clear PID so producers stop trying to signal us. */
     pg_atomic_write_u32(&hdr->bgworker_pid, 0);
 
-    /* Flush everything before exiting. */
-    for (auto &[oid, tw] : g_tables) {
-        try { tw->flush(); }
-        catch (...) {}
-    }
+    /* Flush and publish everything before exiting. */
+    do_flush_all();
 
     /* Shut down cloud-offload SDKs. */
     paimon::s3_sdk_shutdown();
 
     ereport(LOG, errmsg("paimon_bgworker: shutting down"));
-    proc_exit(0);
+    /*
+     * Exit code 1, not 0: a worker that exits with 0 is unregistered by the
+     * postmaster and never restarted, so a stray SIGTERM (pg_terminate_backend,
+     * an operator's kill) would silently stop all lake mirroring until the
+     * next server restart.  With 1 it is restarted after bgw_restart_time;
+     * during server shutdown nothing is restarted either way.
+     */
+    proc_exit(1);
 }
 
 /*

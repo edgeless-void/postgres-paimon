@@ -11,8 +11,18 @@
  *   [1 byte:  PaimonMsgType]
  *   [payload...]
  *
- * DML messages (PMSG_DML_BATCH) are fire-and-forget: the TAM does not wait
- * for an ACK.  DDL messages always wait for a PaimonAck reply.
+ * All messages are fire-and-forget: a backend queues them for the duration
+ * of its transaction and writes them to the ring at COMMIT, followed by a
+ * PMSG_SYNC (see paimon_client.h).  Nothing is sent for aborted work.
+ *
+ * Table identifiers ("table_name" below) are "<paimon db>\0<relname>":
+ * PostgreSQL schema "public" → Paimon database "default", any other schema →
+ * the database of the same name.  A name without '\0' (older builds,
+ * recovery journals) means database "default".
+ *
+ * PMSG_DDL_CREATE carries the table's full current schema; the bgworker
+ * creates the table or reconciles an existing one to it.  ADD_COL / DROP_COL
+ * / RENAME / TYPE are no longer produced; the bgworker still accepts them.
  */
 
 typedef enum PaimonMsgType {

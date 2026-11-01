@@ -42,11 +42,23 @@ public:
     bool exists() const { return current_.id >= 0 && !current_.fields.empty(); }
 
     /*
-     * Bootstrap: write schema-0 from a CREATE event.
-     * No-op if schema already exists (idempotent).
+     * Bootstrap: write schema-0 from a CREATE event.  If the schema already
+     * exists, reconcile() it to the incoming definition instead.
      */
     bool bootstrap(const std::vector<FieldDef>& fields,
                    const std::vector<std::string>& pk_names);
+
+    /*
+     * Make the current schema match `fields` (the full PostgreSQL column
+     * list, matched by field id = attnum): add missing fields, drop fields
+     * PostgreSQL no longer has, apply renames / type / nullability changes.
+     * The hidden sequence field is kept; metadata fields (id >= 0xFF00) are
+     * added but never dropped.  Writes schema-(id+1) only if something
+     * changed.  With dry_run, only reports whether anything would change.
+     */
+    bool reconcile(const std::vector<FieldDef>& fields,
+                   const std::vector<std::string>& pk_names,
+                   bool dry_run = false);
 
     /* Evolve: write schema-(id+1) atomically. */
     bool addField(const FieldDef& f);

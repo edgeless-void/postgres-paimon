@@ -109,18 +109,7 @@ bool PaimonSchemaManager::writeSchema(const SchemaVersion& sv) {
 bool PaimonSchemaManager::bootstrap(const std::vector<FieldDef>& fields,
                                      const std::vector<std::string>& pk_names) {
     if (exists()) {
-        /* Schema-0 already written.  Silently add any metadata fields
-         * (field_id >= 0xFF00) that exist in the incoming definition but
-         * are missing from the on-disk schema — this handles the case where
-         * paimon_heap.meta_field_* GUCs were enabled after the table was
-         * first created. */
-        for (const auto& f : fields) {
-            if (f.field_id < 0xFF00u) continue;
-            bool found = false;
-            for (const auto& cf : current_.fields)
-                if (cf.field_id == f.field_id) { found = true; break; }
-            if (!found) addField(f);
-        }
+        reconcile(fields, pk_names);
         return true;
     }
 
@@ -140,6 +129,65 @@ bool PaimonSchemaManager::bootstrap(const std::vector<FieldDef>& fields,
         if ((int32_t)f.field_id > sv.highest_field_id)
             sv.highest_field_id = (int32_t)f.field_id;
     sv.primary_keys = pk_names;
+    return writeSchema(sv);
+}
+
+bool PaimonSchemaManager::reconcile(const std::vector<FieldDef>& fields,
+                                     const std::vector<std::string>& pk_names,
+                                     bool dry_run) {
+    if (!exists()) return !fields.empty();
+
+    SchemaVersion sv = current_;
+    bool changed = false;
+
+    /* Drop fields PostgreSQL no longer has (keep _seq and metadata fields). */
+    auto keep = [&](const FieldDef& f) {
+        if (f.field_id == 32767 || f.field_id >= 0xFF00u) return true;
+        for (const auto& in : fields)
+            if (in.field_id == f.field_id) return true;
+        return false;
+    };
+    std::vector<FieldDef> kept;
+    for (const auto& f : sv.fields) {
+        if (keep(f)) kept.push_back(f);
+        else changed = true;
+    }
+    sv.fields.swap(kept);
+
+    /* Update existing fields in place and append new ones, like addField()
+       does (Paimon resolves columns by field id, not by position). */
+    for (const auto& in : fields) {
+        bool found = false;
+        for (auto& f : sv.fields) {
+            if (f.field_id != in.field_id) continue;
+            found = true;
+            if (f.name != in.name || f.type_code != in.type_code ||
+                f.typmod != in.typmod || f.not_null != in.not_null) {
+                f.name      = in.name;
+                f.type_code = in.type_code;
+                f.typmod    = in.typmod;
+                f.not_null  = in.not_null;
+                changed = true;
+            }
+            break;
+        }
+        if (!found) {
+            sv.fields.push_back(in);
+            if ((int32_t)in.field_id > sv.highest_field_id)
+                sv.highest_field_id = (int32_t)in.field_id;
+            changed = true;
+        }
+    }
+
+    /* Primary key is immutable in PostgreSQL (blocked), but its column may
+       have been renamed. */
+    if (!pk_names.empty() && pk_names != sv.primary_keys) {
+        sv.primary_keys = pk_names;
+        changed = true;
+    }
+
+    if (!changed || dry_run) return changed;
+    sv.id++;
     return writeSchema(sv);
 }
 

@@ -1,22 +1,19 @@
 -- paimon_heap regression tests
 -- Run with: make installcheck PGUSER=<superuser>
 -- Requires: shared_preload_libraries = 'paimon_heap' in postgresql.conf
-SET paimon_heap.warehouse = '/tmp/paimon-regress-warehouse';
-SET
+-- (paimon_heap.warehouse is PGC_SIGHUP: set it in postgresql.conf, not here)
 -- 0. Access method is registered
 SELECT amname FROM pg_am WHERE amname = 'paimon_heap';
-   amname
+   amname    
 -------------
  paimon_heap
 (1 row)
 
 -- 1. Basic table lifecycle
 CREATE TABLE t1 (id int, payload text) USING paimon_heap;
-CREATE TABLE
 INSERT INTO t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
-INSERT 0 3
 SELECT * FROM t1 ORDER BY id;
- id | payload
+ id | payload 
 ----+---------
   1 | alpha
   2 | beta
@@ -24,9 +21,8 @@ SELECT * FROM t1 ORDER BY id;
 (3 rows)
 
 UPDATE t1 SET payload = 'ALPHA' WHERE id = 1;
-UPDATE 1
 SELECT * FROM t1 ORDER BY id;
- id | payload
+ id | payload 
 ----+---------
   1 | ALPHA
   2 | beta
@@ -34,23 +30,20 @@ SELECT * FROM t1 ORDER BY id;
 (3 rows)
 
 DELETE FROM t1 WHERE id = 3;
-DELETE 1
 SELECT COUNT(*) FROM t1;
- count
+ count 
 -------
      2
 (1 row)
 
 TRUNCATE t1;
-TRUNCATE TABLE
 SELECT COUNT(*) FROM t1;
- count
+ count 
 -------
      0
 (1 row)
 
 DROP TABLE t1;
-DROP TABLE
 -- 2. Multi-column scalar type coverage
 CREATE TABLE t2 (
     id      bigint,
@@ -59,50 +52,41 @@ CREATE TABLE t2 (
     amt     numeric(12,4),
     label   varchar(64)
 ) USING paimon_heap;
-CREATE TABLE
 INSERT INTO t2 VALUES
     (1, '2024-01-01 00:00:00+00', true,  100.5000, 'first'),
     (2, '2024-06-15 12:00:00+00', false, 200.7500, 'second');
-INSERT 0 2
 SELECT id, flag, amt, label FROM t2 ORDER BY id;
- id | flag |   amt    | label
+ id | flag |   amt    | label  
 ----+------+----------+--------
   1 | t    | 100.5000 | first
   2 | f    | 200.7500 | second
 (2 rows)
 
 DROP TABLE t2;
-DROP TABLE
 -- 3. DDL: column add / drop
 CREATE TABLE t3 (id int, a text) USING paimon_heap;
-CREATE TABLE
 INSERT INTO t3 VALUES (1, 'x');
-INSERT 0 1
-ALTER TABLE t3 ADD COLUMN b int DEFAULT 42;
-ALTER TABLE
+ALTER TABLE t3 ADD COLUMN b int;
+UPDATE t3 SET b = 42;
 SELECT * FROM t3 ORDER BY id;
- id | a | b
+ id | a | b  
 ----+---+----
   1 | x | 42
 (1 row)
 
 ALTER TABLE t3 DROP COLUMN a;
-ALTER TABLE
 SELECT * FROM t3 ORDER BY id;
- id | b
+ id | b  
 ----+----
   1 | 42
 (1 row)
 
 DROP TABLE t3;
-DROP TABLE
 -- 4. Sequence / serial column
 CREATE TABLE t4 (id serial, v text) USING paimon_heap;
-CREATE TABLE
 INSERT INTO t4 (v) VALUES ('one'), ('two'), ('three');
-INSERT 0 3
 SELECT v FROM t4 ORDER BY id;
-   v
+   v   
 -------
  one
  two
@@ -110,4 +94,68 @@ SELECT v FROM t4 ORDER BY id;
 (3 rows)
 
 DROP TABLE t4;
-DROP TABLE
+-- 5. Operations blocked because the lake cannot follow them
+CREATE TABLE t5 (id int PRIMARY KEY, v text) USING paimon_heap;
+ALTER TABLE t5 ADD COLUMN d int DEFAULT 1;
+ERROR:  paimon_heap: column default values are not supported
+DETAIL:  Column "d" has a DEFAULT clause.
+HINT:  Remove the DEFAULT clause; existing rows will read NULL for newly added columns.
+ALTER TABLE t5 ADD PRIMARY KEY (v);
+ERROR:  paimon_heap: changing the primary key is not supported
+HINT:  Recreate the table with the desired primary key.
+ALTER TABLE t5 RENAME TO t5_renamed;
+ERROR:  paimon_heap: renaming a paimon_heap table is not supported
+DETAIL:  The Paimon table location is derived from the schema and table name; changing them would detach the table from its lake data.
+HINT:  Create a new table with the desired name and copy the data.
+CREATE SCHEMA s5;
+ALTER TABLE t5 SET SCHEMA s5;
+ERROR:  paimon_heap: moving a paimon_heap table to another schema is not supported
+DETAIL:  The Paimon table location is derived from the schema and table name; changing them would detach the table from its lake data.
+HINT:  Create a new table with the desired name and copy the data.
+CREATE TABLE s5.t5b (id int) USING paimon_heap;
+ALTER SCHEMA s5 RENAME TO s5_renamed;
+ERROR:  paimon_heap: renaming a schema that contains paimon_heap tables is not supported
+DETAIL:  The Paimon table location is derived from the schema and table name; changing them would detach the table from its lake data.
+HINT:  Create a new table with the desired name and copy the data.
+BEGIN;
+INSERT INTO t5 VALUES (1, 'one');
+PREPARE TRANSACTION 'paimon_regress';
+ERROR:  cannot PREPARE a transaction that has modified paimon_heap tables
+-- renaming a column is fine
+ALTER TABLE t5 RENAME COLUMN v TO val;
+INSERT INTO t5 VALUES (2, 'two');
+SELECT * FROM t5 ORDER BY id;
+ id | val 
+----+-----
+  2 | two
+(1 row)
+
+DROP SCHEMA s5 CASCADE;
+NOTICE:  drop cascades to table s5.t5b
+DROP TABLE t5;
+-- 6. Rolled-back DDL / savepoints leave the table intact and writable
+CREATE TABLE t6 (id int PRIMARY KEY, x int) USING paimon_heap;
+INSERT INTO t6 VALUES (1, 10);
+BEGIN;
+DROP TABLE t6;
+ROLLBACK;
+BEGIN;
+TRUNCATE t6;
+ALTER TABLE t6 DROP COLUMN x;
+ROLLBACK;
+BEGIN;
+INSERT INTO t6 VALUES (2, 20);
+SAVEPOINT sp;
+INSERT INTO t6 VALUES (3, 30);
+ROLLBACK TO sp;
+INSERT INTO t6 VALUES (4, 40);
+COMMIT;
+SELECT * FROM t6 ORDER BY id;
+ id | x  
+----+----
+  1 | 10
+  2 | 20
+  4 | 40
+(3 rows)
+
+DROP TABLE t6;

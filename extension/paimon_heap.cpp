@@ -36,6 +36,8 @@ extern "C" {
 #include "access/htup_details.h"
 #include "access/genam.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
@@ -66,6 +68,7 @@ extern void paimon_ddl_init(void);
 } // extern "C"
 
 #include "paimon_client.h"
+#include "paimon_relmeta.h"
 #include "paimon_shmem.h"
 #include "paimon_wal.h"
 
@@ -103,6 +106,12 @@ paimon_shmem_startup_hook(void)
     paimon_shmem_init();      /* ShmemInitStruct + GetNamedLWLockTranche */
 }
 
+static void paimon_xact_callback(XactEvent event, void *arg);
+static void paimon_subxact_callback(SubXactEvent event,
+                                    SubTransactionId mySubid,
+                                    SubTransactionId parentSubid,
+                                    void *arg);
+
 /* ── _PG_init ─────────────────────────────────────────────────────── */
 extern "C" void
 _PG_init(void)
@@ -135,6 +144,14 @@ _PG_init(void)
     /* DDL intercept hook. */
     paimon_ddl_init();
 
+    /*
+     * Transaction callbacks are registered up front (not lazily on the first
+     * DML) so that savepoints started before the first paimon_heap write are
+     * tracked, and DDL-only transactions are delivered too.
+     */
+    RegisterXactCallback(paimon_xact_callback, NULL);
+    RegisterSubXactCallback(paimon_subxact_callback, NULL);
+
     /* Register the background worker. */
     BackgroundWorker bgw;
     memset(&bgw, 0, sizeof(bgw));
@@ -149,37 +166,53 @@ _PG_init(void)
     RegisterBackgroundWorker(&bgw);
 }
 
-/* ── Transaction callback ─────────────────────────────────────────── */
-static bool xact_cb_registered = false;
+/* ── Transaction callbacks ────────────────────────────────────────── */
 
 static void
 paimon_xact_callback(XactEvent event, void *arg)
 {
+    PaimonClient &client = PaimonClient::instance();
+
     switch (event) {
         case XACT_EVENT_PRE_COMMIT:
             /*
-             * Serialise buffered rows → pending_msgs_.
-             * When wal_level = 'local', also writes + flushes a WAL record so
-             * the messages survive a crash.  Fires before RecordTransactionCommit,
+             * Serialise queued rows + DDL → pending_msgs_.
+             * When wal_level = 'local', also writes a WAL record so the
+             * messages survive a crash.  Fires before RecordTransactionCommit,
              * so the WAL flush is absorbed into the transaction's commit fsync.
              */
-            paimon_client_prepare_commit();
+            client.prepareCommit();
             break;
         case XACT_EVENT_COMMIT:
             /* Push pending_msgs_ (built at PRE_COMMIT) to the ring buffer. */
-            paimon_client_flush_all();
+            client.flushAll();
             break;
         case XACT_EVENT_PARALLEL_COMMIT:
             /*
              * Parallel workers have no PARALLEL_PRE_COMMIT event, so do both
              * steps here.  WAL durability is best-effort in parallel workers.
              */
-            paimon_client_prepare_commit();
-            paimon_client_flush_all();
+            client.prepareCommit();
+            client.flushAll();
+            break;
+        case XACT_EVENT_PRE_PREPARE:
+            /*
+             * The ring is fed at COMMIT by the backend that did the work; a
+             * prepared transaction is committed later (possibly by another
+             * backend, possibly never), so its lake changes could neither be
+             * delivered nor safely kept.  Refuse, like PostgreSQL does for
+             * temporary tables.
+             */
+            if (client.hasPending())
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("cannot PREPARE a transaction that has modified "
+                                "paimon_heap tables")));
             break;
         case XACT_EVENT_ABORT:
         case XACT_EVENT_PARALLEL_ABORT:
-            paimon_client_discard_all();
+        case XACT_EVENT_PREPARE:
+            client.discardAll();
             break;
         default:
             break;
@@ -187,12 +220,30 @@ paimon_xact_callback(XactEvent event, void *arg)
 }
 
 static void
+paimon_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+                        SubTransactionId parentSubid, void *arg)
+{
+    PaimonClient &client = PaimonClient::instance();
+
+    switch (event) {
+        case SUBXACT_EVENT_START_SUB:
+            client.startSubXact((uint32_t) mySubid);
+            break;
+        case SUBXACT_EVENT_COMMIT_SUB:
+            client.commitSubXact((uint32_t) mySubid);
+            break;
+        case SUBXACT_EVENT_ABORT_SUB:
+            client.abortSubXact((uint32_t) mySubid);
+            break;
+        default:
+            break;
+    }
+}
+
+/* Kept for the DML wrappers; callbacks are registered in _PG_init. */
+static inline void
 ensure_xact_cb(void)
 {
-    if (!xact_cb_registered) {
-        RegisterXactCallback(paimon_xact_callback, NULL);
-        xact_cb_registered = true;
-    }
 }
 
 /* ── Type mapping (PG OID → Paimon type code + typmod) ─────────────── */
@@ -296,15 +347,26 @@ serialize_datum(Oid typoid, Datum d, bool isnull,
 }
 
 /* ── Schema fingerprint ─────────────────────────────────────────────── */
-static uint32_t
-schema_fingerprint(TupleDesc td)
+/*
+ * Covers everything that ends up in the Paimon schema (attnum, type, typmod,
+ * nullability, name), so any difference makes the backend re-send the full
+ * schema and the bgworker reconciles — even if an individual DDL event was
+ * never applied (e.g. it was dropped from a full ring).
+ */
+uint32_t
+paimon_schema_fingerprint(TupleDesc td)
 {
     uint32_t h = 0x811c9dc5u;
     for (int i = 0; i < td->natts; i++) {
         Form_pg_attribute att = TupleDescAttr(td, i);
         if (att->attisdropped) continue;
-        h ^= (uint32_t)att->attnum;   h *= 0x01000193u;
-        h ^= (uint32_t)att->atttypid; h *= 0x01000193u;
+        h ^= (uint32_t)att->attnum;    h *= 0x01000193u;
+        h ^= (uint32_t)att->atttypid;  h *= 0x01000193u;
+        h ^= (uint32_t)att->atttypmod; h *= 0x01000193u;
+        h ^= (uint32_t)att->attnotnull; h *= 0x01000193u;
+        for (const char *c = NameStr(att->attname); *c; c++) {
+            h ^= (uint8_t)*c; h *= 0x01000193u;
+        }
     }
     /* Include presence of metadata fields so schema re-bootstraps if config changes. */
     uint32_t meta = ((guc_meta_xid_field && guc_meta_xid_field[0]) ? 1u : 0u)
@@ -314,9 +376,80 @@ schema_fingerprint(TupleDesc td)
     return h;
 }
 
+/* ── Lake identity of a relation ────────────────────────────────────── */
+
+static std::string
+make_ident(Oid nspid, const char *relname)
+{
+    std::string db = "default";
+    char *nsp = get_namespace_name(nspid);
+    if (nsp && strcmp(nsp, "public") != 0)
+        db = nsp;
+    std::string ident = db;
+    ident.push_back('\0');
+    ident += relname;
+    return ident;
+}
+
+std::string
+paimon_rel_ident(Relation rel)
+{
+    return make_ident(RelationGetNamespace(rel), RelationGetRelationName(rel));
+}
+
+std::string
+paimon_rel_ident_oid(Oid relid)
+{
+    char *relname = get_rel_name(relid);
+    if (!relname)
+        return std::string();
+    return make_ident(get_rel_namespace(relid), relname);
+}
+
+/*
+ * make_new_heap() names the transient heap of a table rewrite
+ * "pg_temp_<oid of the table being rewritten>".
+ */
+static bool
+is_transient_rewrite_heap(Oid relid, const char *relname)
+{
+    if (strncmp(relname, "pg_temp_", 8) != 0)
+        return false;
+    const char *p = relname + 8;
+    if (*p == '\0')
+        return false;
+    for (const char *q = p; *q; q++)
+        if (*q < '0' || *q > '9')
+            return false;
+    Oid orig = (Oid) strtoul(p, NULL, 10);
+    return OidIsValid(orig) && orig != relid && get_rel_name(orig) != NULL;
+}
+
+bool
+paimon_rel_is_mirrored(Relation rel)
+{
+    if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+        return false;
+    if (rel->rd_rel->relkind != RELKIND_RELATION)
+        return false;
+    return !is_transient_rewrite_heap(RelationGetRelid(rel),
+                                      RelationGetRelationName(rel));
+}
+
+bool
+paimon_relid_is_mirrored(Oid relid)
+{
+    if (get_rel_persistence(relid) == RELPERSISTENCE_TEMP)
+        return false;
+    if (get_rel_relkind(relid) != RELKIND_RELATION)
+        return false;
+    char *relname = get_rel_name(relid);
+    return relname && !is_transient_rewrite_heap(relid, relname);
+}
+
 /* ── Column metadata from Relation ─────────────────────────────────── */
-static void
-build_col_meta(Relation rel,
+void
+paimon_build_col_meta(Relation rel,
                std::vector<PaimonColumn> &cols,
                std::vector<uint16_t>     &pk_attnums)
 {
@@ -333,6 +466,14 @@ build_col_meta(Relation rel,
         cols.push_back(c);
     }
 
+    /*
+     * rd_pkindex is only valid once the relcache has computed the index list
+     * (RelationGetIndexList fills it in lazily).  Right after CREATE TABLE —
+     * or for a relation the executor has not opened indexes on yet — it is
+     * still InvalidOid, which would bootstrap the lake table without its
+     * primary key.
+     */
+    list_free(RelationGetIndexList(rel));
     if (OidIsValid(rel->rd_pkindex)) {
         Relation pkidx = index_open(rel->rd_pkindex, AccessShareLock);
         IndexInfo *ii  = BuildIndexInfo(pkidx);
@@ -379,12 +520,15 @@ next_seq(void)
 static void
 buffer_slot(Relation rel, TupleTableSlot *slot, PaimonRowKind kind)
 {
+    if (!paimon_rel_is_mirrored(rel))
+        return;
+
     TupleDesc td = slot->tts_tupleDescriptor;
-    uint32_t  fp = schema_fingerprint(td);
+    uint32_t  fp = paimon_schema_fingerprint(td);
 
     std::vector<PaimonColumn>  cols;
     std::vector<uint16_t>      pk_attnums;
-    build_col_meta(rel, cols, pk_attnums);
+    paimon_build_col_meta(rel, cols, pk_attnums);
 
     std::vector<uint16_t>        attnums;
     std::vector<PaimonTypeCode>  types;
@@ -433,7 +577,7 @@ buffer_slot(Relation rel, TupleTableSlot *slot, PaimonRowKind kind)
 
     PaimonClient::instance().bufferRow(
         RelationGetRelid(rel),
-        RelationGetRelationName(rel),
+        paimon_rel_ident(rel),
         fp, cols, pk_attnums, kind, seq,
         attnums, types, lengths, values);
 }
@@ -447,7 +591,17 @@ fetch_and_buffer_old(Relation rel, ItemPointer tid,
     HeapTupleData   tuple;
     ItemPointerCopy(tid, &tuple.t_self);
 
-    bool found = heap_fetch(rel, snapshot, &tuple, &buf, false);
+    /*
+     * The before-image is the exact row version at tid, which is what the
+     * heap is about to update/delete.  It is fetched with SnapshotAny (as
+     * the executor does for row triggers, see GetTupleForTrigger): after an
+     * EvalPlanQual recheck under READ COMMITTED, tid points at a version
+     * committed after the statement's snapshot, which that snapshot cannot
+     * see — the -U / -D event would silently be lost.  If the heap call then
+     * fails (TM_Updated, ...), the caller retracts the event.
+     */
+    (void) snapshot;
+    bool found = heap_fetch(rel, SnapshotAny, &tuple, &buf, false);
     if (!found) {
         if (BufferIsValid(buf)) ReleaseBuffer(buf);
         return;
@@ -573,11 +727,14 @@ ph_tuple_delete(Relation rel, ItemPointer tid,
                 Snapshot snapshot, Snapshot crosscheck,
                 bool wait, TM_FailureData *tmfd)
 {
+    size_t mark = PaimonClient::instance().rowMark(RelationGetRelid(rel));
     fetch_and_buffer_old(rel, tid, snapshot, PROW_DELETE);
     TM_Result r = GetHeapamTableAmRoutine()->tuple_delete(
         rel, tid, cid, options, snapshot, crosscheck, wait, tmfd);
     if (r == TM_Ok)
         ensure_xact_cb();
+    else    /* concurrent update/delete: no change happened, retract -D */
+        PaimonClient::instance().truncateRows(RelationGetRelid(rel), mark);
     return r;
 }
 
@@ -588,6 +745,7 @@ ph_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
                 TM_FailureData *tmfd, LockTupleMode *lockmode,
                 TU_UpdateIndexes *update_indexes)
 {
+    size_t mark = PaimonClient::instance().rowMark(RelationGetRelid(rel));
     fetch_and_buffer_old(rel, otid, snapshot, PROW_UPDATE_BEFORE);
     TM_Result r = GetHeapamTableAmRoutine()->tuple_update(
         rel, otid, slot, cid, options, snapshot, crosscheck,
@@ -595,6 +753,9 @@ ph_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
     if (r == TM_Ok) {
         ensure_xact_cb();
         buffer_slot(rel, slot, PROW_UPDATE_AFTER);
+    } else {
+        /* concurrent update/delete: no change happened, retract -U */
+        PaimonClient::instance().truncateRows(RelationGetRelid(rel), mark);
     }
     return r;
 }
@@ -605,11 +766,14 @@ ph_tuple_delete(Relation rel, ItemPointer tid,
                 Snapshot snapshot, Snapshot crosscheck,
                 bool wait, TM_FailureData *tmfd, bool changingPart)
 {
+    size_t mark = PaimonClient::instance().rowMark(RelationGetRelid(rel));
     fetch_and_buffer_old(rel, tid, snapshot, PROW_DELETE);
     TM_Result r = GetHeapamTableAmRoutine()->tuple_delete(
         rel, tid, cid, snapshot, crosscheck, wait, tmfd, changingPart);
     if (r == TM_Ok)
         ensure_xact_cb();
+    else    /* concurrent update/delete: no change happened, retract -D */
+        PaimonClient::instance().truncateRows(RelationGetRelid(rel), mark);
     return r;
 }
 
@@ -620,6 +784,7 @@ ph_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
                 TM_FailureData *tmfd, LockTupleMode *lockmode,
                 TU_UpdateIndexes *update_indexes)
 {
+    size_t mark = PaimonClient::instance().rowMark(RelationGetRelid(rel));
     fetch_and_buffer_old(rel, otid, snapshot, PROW_UPDATE_BEFORE);
     TM_Result r = GetHeapamTableAmRoutine()->tuple_update(
         rel, otid, slot, cid, snapshot, crosscheck,
@@ -627,6 +792,9 @@ ph_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
     if (r == TM_Ok) {
         ensure_xact_cb();
         buffer_slot(rel, slot, PROW_UPDATE_AFTER);
+    } else {
+        /* concurrent update/delete: no change happened, retract -U */
+        PaimonClient::instance().truncateRows(RelationGetRelid(rel), mark);
     }
     return r;
 }

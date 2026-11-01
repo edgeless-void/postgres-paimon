@@ -102,6 +102,64 @@ paimon_ring_write(const void *data, size_t len)
     return true;
 }
 
+bool
+paimon_ring_write_batch(const void *const *datas, const size_t *lens, int n)
+{
+    PaimonRingHdr *hdr  = paimon_ring_hdr();
+    LWLock        *lock = paimon_ring_lock();
+    uint8_t       *ring = paimon_ring_data();
+
+    if (n <= 0)
+        return true;
+    if (!hdr || !lock || !ring)
+        return false;
+
+    uint64_t total = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (lens[i] == 0 || lens[i] > (size_t)UINT32_MAX)
+            return false;
+        total += lens[i];
+    }
+
+    uint32_t ring_size = hdr->ring_size;
+
+    LWLockAcquire(lock, LW_EXCLUSIVE);
+
+    uint64_t used  = hdr->write_pos - hdr->read_pos;
+    uint64_t avail = ring_size - used;
+
+    /*
+     * All-or-nothing: a transaction's messages either all reach the ring or
+     * none do, so the bgworker never applies half of a transaction.
+     */
+    if (avail < total)
+    {
+        LWLockRelease(lock);
+        pg_atomic_fetch_add_u32(&hdr->dropped_msgs, (uint32) n);
+        return false;
+    }
+
+    for (int i = 0; i < n; i++)
+    {
+        ring_copy_in(ring, ring_size, hdr->write_pos, datas[i], lens[i]);
+        hdr->write_pos += lens[i];
+    }
+
+    uint32 bgw_pid = pg_atomic_read_u32(&hdr->bgworker_pid);
+
+    LWLockRelease(lock);
+    ConditionVariableBroadcast(&hdr->has_data_cv);
+
+    if (bgw_pid != 0) {
+        PGPROC *proc = BackendPidGetProc((int) bgw_pid);
+        if (proc != NULL)
+            SetLatch(&proc->procLatch);
+    }
+
+    return true;
+}
+
 size_t
 paimon_ring_read_msg(char **out_buf)
 {

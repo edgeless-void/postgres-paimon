@@ -26,6 +26,13 @@ extern "C" {
 bool   paimon_ring_write(const void *data, size_t len);
 
 /*
+ * Write n framed messages atomically: either all of them are appended to the
+ * ring (contiguously, under one lock acquisition) or none are.  Used at
+ * COMMIT so a transaction is never delivered partially.
+ */
+bool   paimon_ring_write_batch(const void *const *datas, const size_t *lens, int n);
+
+/*
  * Read one complete framed message from the ring.
  * Blocks until data is available or shutdown is requested.
  * On success fills *out_buf (palloc'd, caller must pfree) and returns len > 0.
